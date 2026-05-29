@@ -40,10 +40,17 @@ extern "C" {
 /* Number of slots migrated per operation during incremental rehash */
 #define HASH_REHASH_BATCH  16
 
+/* Swiss Table group width (must match SIMD register width) */
+#define HASH_GROUP_WIDTH  16
+
+/* ctrl byte values */
+#define HASH_CTRL_EMPTY    ((uint8_t)0xFF)
+#define HASH_CTRL_DELETED  ((uint8_t)0x80)
+/* Occupied: top 7 bits of h2 with high bit clear (0x00..0x7F) */
+
 /*
- * Hash slot: stores one key-value mapping in an open-addressing table.
- * feat_id == 0 means the slot is empty (sentinel).
- * NOTE: feat_id=0 is reserved and cannot be used as a valid feature ID.
+ * Hash slot: stores one key-value mapping.
+ * No sentinel needed in data — ctrl byte array handles empty/occupied state.
  */
 typedef struct {
     uint64_t  feat_id;
@@ -52,36 +59,42 @@ typedef struct {
 } HashSlot;
 
 /*
- * HashIndex: open-addressing hash table with linear probing
- * and incremental rehash support.
+ * Swiss Table hash index.
  *
- * When rehashing:
- *   - old_slots holds the previous table being migrated
- *   - rehash_cursor tracks progress through old_slots
- *   - Lookups probe new table first, then old table if key not found
- *   - Each mutation operation migrates HASH_REHASH_BATCH slots
+ * Layout: ctrl[] array (1 byte per slot, grouped in 16-byte groups)
+ *         + slots[] array (HashSlot per slot).
+ *
+ * Probe: hash → h1 (position) + h2 (7-bit fingerprint in ctrl).
+ * Each probe step checks 16 ctrl bytes at once (NEON/SSE or byte loop).
+ * ctrl byte encoding:
+ *   0x00..0x7F = occupied (h2 fingerprint, high bit = 0)
+ *   0x80       = deleted (tombstone)
+ *   0xFF       = empty
+ *
+ * Capacity is always a multiple of HASH_GROUP_WIDTH.
+ * ctrl[] has GROUP_WIDTH extra "mirror" bytes at end for unaligned SIMD loads.
  */
 typedef struct {
-    HashSlot   *slots;          /* current (new) table */
-    uint32_t    capacity;       /* current table capacity */
-    uint32_t    count;          /* total live entries (across both tables) */
-    uint32_t    mask;           /* capacity - 1 */
+    uint8_t    *ctrl;           /* ctrl byte array [capacity + GROUP_WIDTH] */
+    HashSlot   *slots;          /* data array [capacity] */
+    uint32_t    capacity;       /* always multiple of GROUP_WIDTH */
+    uint32_t    count;          /* live entries (across both tables) */
+    uint32_t    growth_left;    /* remaining inserts before grow */
 
-    /* Incremental rehash state (NULL when not rehashing) */
+    /* Incremental rehash state */
+    uint8_t    *old_ctrl;
     HashSlot   *old_slots;
     uint32_t    old_capacity;
-    uint32_t    old_mask;
-    uint32_t    rehash_cursor;  /* next slot to migrate in old_slots */
+    uint32_t    rehash_cursor;
 } HashIndex;
 
 /*
  * Iterator for scanning all entries in the hash table.
- * Handles iteration across both tables during rehash.
  */
 typedef struct {
     const HashIndex *index;
     uint32_t         pos;
-    bool             in_old;    /* true if currently iterating old_slots */
+    bool             in_old;
 } HashIter;
 
 /* Lifecycle */
