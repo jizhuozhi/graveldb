@@ -1,11 +1,11 @@
 /*
  * GravelDB - Network (Client/Server) Benchmark
  *
- * Forks a graveldb-server process, connects via TCP with the C client SDK,
- * and measures end-to-end throughput & latency across the actual network
- * stack (loopback).
+ * Starts a graveldb-server in a background thread, connects via TCP with
+ * the C client SDK, and measures end-to-end throughput & latency across
+ * the actual network stack (loopback).
  *
- * Dependencies: client SDK (client.h) only. No src/ internals.
+ * Dependencies: client SDK (client.h), server lib (server.h).
  *
  * Benchmarks:
  *   1. Ping round-trip latency
@@ -16,6 +16,7 @@
  */
 
 #include "client.h"
+#include "server.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,8 +24,6 @@
 #include <sys/time.h>
 #include <math.h>
 #include <pthread.h>
-#include <signal.h>
-#include <sys/wait.h>
 
 
 #define BENCH_DIR       "/tmp/graveldb_bench_network"
@@ -128,57 +127,44 @@ static void lat_free(LatencyCollector *lc) {
 }
 
 
-static pid_t g_server_pid = -1;
+static GravelServer *g_server = NULL;
+static pthread_t     g_server_thread;
 
-/* Locate the server binary relative to the bench executable or via env */
-static const char *find_server_bin(void) {
-    static char path[1024];
-
-    /* Allow override via environment */
-    const char *env = getenv("GRAVELDB_SERVER_BIN");
-    if (env && env[0]) return env;
-
-    /* Default: assume build/graveldb-server next to bench binary */
-    snprintf(path, sizeof(path), "./build/graveldb-server");
-    if (access(path, X_OK) == 0) return path;
-
-    /* Fallback: look in same directory as running binary */
-    snprintf(path, sizeof(path), "graveldb-server");
-    return path;
+static void *server_thread_fn(void *arg) {
+    GravelServer *srv = (GravelServer *)arg;
+    gravel_server_start(srv);
+    return NULL;
 }
 
 static int start_server(void) {
     cleanup();
 
-    const char *bin = find_server_bin();
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", BENCH_PORT);
+    GravelServerConfig config;
+    memset(&config, 0, sizeof(config));
 
-    char dim_str[16];
-    snprintf(dim_str, sizeof(dim_str), "%d", DIM);
+    static int dims[] = {DIM};
+    config.db_config.data_dir = BENCH_DIR;
+    config.db_config.num_dims = 1;
+    config.db_config.dims = dims;
+    config.db_config.buffer_size = 256UL * 1024 * 1024;
+    config.db_config.index_capacity = 1 << 24;
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("[bench_network] fork failed");
+    config.port = BENCH_PORT;
+    config.num_workers = 0;
+    config.backlog = 128;
+    config.max_request_size = 64 * 1024 * 1024;
+    config.auto_flush_interval_ms = 5000;
+    config.auto_checkpoint_interval_s = 3600;
+    config.readonly = false;
+    config.num_read_workers = 0;
+
+    graveldb_status_t rc = gravel_server_create(&g_server, &config);
+    if (rc != GRAVELDB_OK) {
+        fprintf(stderr, "[bench_network] Failed to create server: %d\n", rc);
         return -1;
     }
 
-    if (pid == 0) {
-        /* Child: exec the server */
-        execlp(bin, bin,
-               "-d", BENCH_DIR,
-               "-p", port_str,
-               "-D", dim_str,
-               "-b", "256",
-               "--flush-ms", "5000",
-               "--checkpoint-s", "3600",
-               NULL);
-        perror("[bench_network] exec server failed");
-        _exit(127);
-    }
-
-    /* Parent: wait for server to be ready */
-    g_server_pid = pid;
+    pthread_create(&g_server_thread, NULL, server_thread_fn, g_server);
 
     /* Poll until server is accepting connections (up to 5 seconds) */
     for (int i = 0; i < 50; i++) {
@@ -188,29 +174,22 @@ static int start_server(void) {
             graveldb_client_close(probe);
             return 0;
         }
-        /* Check if child died */
-        int status;
-        pid_t w = waitpid(pid, &status, WNOHANG);
-        if (w > 0) {
-            fprintf(stderr, "[bench_network] Server process exited prematurely (status=%d)\n", status);
-            g_server_pid = -1;
-            return -1;
-        }
     }
 
     fprintf(stderr, "[bench_network] Server did not become ready in 5 seconds\n");
-    kill(pid, SIGTERM);
-    waitpid(pid, NULL, 0);
-    g_server_pid = -1;
+    gravel_server_stop(g_server);
+    pthread_join(g_server_thread, NULL);
+    gravel_server_destroy(g_server);
+    g_server = NULL;
     return -1;
 }
 
 static void stop_server(void) {
-    if (g_server_pid > 0) {
-        kill(g_server_pid, SIGTERM);
-        int status;
-        waitpid(g_server_pid, &status, 0);
-        g_server_pid = -1;
+    if (g_server) {
+        gravel_server_stop(g_server);
+        pthread_join(g_server_thread, NULL);
+        gravel_server_destroy(g_server);
+        g_server = NULL;
     }
 }
 
@@ -357,13 +336,17 @@ static void bench_batch_push(GravelDBClient *client) {
 
         /* Measure */
         int iters = (batch <= 128) ? 1000 : (batch <= 2048) ? 200 : 50;
+        LatencyCollector lc;
+        lat_init(&lc, iters);
+
         double t0 = now_sec();
         for (int i = 0; i < iters; i++) {
-            /* Shift feat_ids to avoid same-key optimization */
             for (int j = 0; j < batch; j++) {
                 feat_ids[j] = (uint64_t)(i * batch + j + 1);
             }
+            double req_t0 = now_sec();
             graveldb_client_push(client, feat_ids, dims, (const float *const *)embeddings, batch);
+            lat_record(&lc, (now_sec() - req_t0) * 1e6);
         }
         double elapsed = now_sec() - t0;
 
@@ -372,6 +355,11 @@ static void bench_batch_push(GravelDBClient *client) {
         double mb_sec = feats_sec * DIM * sizeof(float) / (1024.0 * 1024.0);
 
         printf("  %-12d  %12.0f  %12.0f  %12.1f\n", batch, ops_sec, feats_sec, mb_sec);
+
+        char label[64];
+        snprintf(label, sizeof(label), "push batch=%d", batch);
+        lat_report(&lc, label);
+        lat_free(&lc);
 
         free(feat_ids);
         free(dims);
@@ -522,12 +510,17 @@ static void bench_batch_pull(GravelDBClient *client) {
 
         /* Measure */
         int iters = (batch <= 128) ? 1000 : (batch <= 2048) ? 200 : 50;
+        LatencyCollector lc;
+        lat_init(&lc, iters);
+
         double t0 = now_sec();
         for (int i = 0; i < iters; i++) {
             for (int j = 0; j < batch; j++) {
                 feat_ids[j] = (xorshift64(&rng_state) % prepop) + 1;
             }
+            double req_t0 = now_sec();
             graveldb_client_pull(client, feat_ids, batch, out_embs, out_dims);
+            lat_record(&lc, (now_sec() - req_t0) * 1e6);
         }
         double elapsed = now_sec() - t0;
 
@@ -536,6 +529,168 @@ static void bench_batch_pull(GravelDBClient *client) {
         double mb_sec = feats_sec * DIM * sizeof(float) / (1024.0 * 1024.0);
 
         printf("  %-12d  %12.0f  %12.0f  %12.1f\n", batch, ops_sec, feats_sec, mb_sec);
+
+        char label[64];
+        snprintf(label, sizeof(label), "pull batch=%d", batch);
+        lat_report(&lc, label);
+        lat_free(&lc);
+
+        free(feat_ids);
+        free(out_embs);
+        free(out_data);
+        free(out_dims);
+    }
+}
+
+static void bench_batch_pull_stream(GravelDBClient *client) {
+    printf("\n[Batch Pull Stream vs Bulk (dim=%d)]\n", DIM);
+    printf("  %-12s  %12s  %12s  %12s  %12s\n",
+           "batch_size", "bulk_p50", "stream_p50", "bulk_p99", "stream_p99");
+    printf("  %-12s  %12s  %12s  %12s  %12s\n",
+           "----------", "--------", "----------", "--------", "----------");
+
+    int prepop = NUM_FEATURES;
+    uint64_t rng_state = 99999;
+
+    for (int bi = 0; bi < NUM_BATCH_SIZES; bi++) {
+        int batch = BATCH_SIZES[bi];
+        if (batch > MAX_WIRE_BATCH) break;
+
+        uint64_t *feat_ids = (uint64_t *)malloc(batch * sizeof(uint64_t));
+        float **out_embs = (float **)malloc(batch * sizeof(float *));
+        float *out_data = (float *)malloc(batch * DIM * sizeof(float));
+        int *out_dims = (int *)malloc(batch * sizeof(int));
+
+        for (int i = 0; i < batch; i++) {
+            out_embs[i] = out_data + i * DIM;
+        }
+
+        /* Warmup both paths thoroughly */
+        for (int w = 0; w < 20; w++) {
+            for (int i = 0; i < batch; i++)
+                feat_ids[i] = (xorshift64(&rng_state) % prepop) + 1;
+            graveldb_client_pull(client, feat_ids, batch, out_embs, out_dims);
+            graveldb_client_pull_stream(client, feat_ids, batch, out_embs, out_dims);
+        }
+
+        int iters = (batch <= 128) ? 1000 : (batch <= 2048) ? 200 : 50;
+
+        /* Interleaved bench: alternate bulk and stream to avoid cache bias.
+         * Use same feat_ids for both to ensure identical data volume. */
+        LatencyCollector lc_bulk;
+        LatencyCollector lc_stream;
+        lat_init(&lc_bulk, iters);
+        lat_init(&lc_stream, iters);
+
+        for (int i = 0; i < iters; i++) {
+            for (int j = 0; j < batch; j++)
+                feat_ids[j] = (xorshift64(&rng_state) % prepop) + 1;
+
+            /* Bulk */
+            double t0 = now_sec();
+            graveldb_client_pull(client, feat_ids, batch, out_embs, out_dims);
+            lat_record(&lc_bulk, (now_sec() - t0) * 1e6);
+
+            /* Stream (same feat_ids) */
+            t0 = now_sec();
+            graveldb_client_pull_stream(client, feat_ids, batch, out_embs, out_dims);
+            lat_record(&lc_stream, (now_sec() - t0) * 1e6);
+        }
+
+        /* Sort for percentile extraction */
+        qsort(lc_bulk.samples, lc_bulk.count, sizeof(double), cmp_double);
+        qsort(lc_stream.samples, lc_stream.count, sizeof(double), cmp_double);
+
+        double bulk_p50 = lc_bulk.samples[lc_bulk.count / 2];
+        double stream_p50 = lc_stream.samples[lc_stream.count / 2];
+        double bulk_p99 = lc_bulk.samples[(int)(lc_bulk.count * 0.99)];
+        double stream_p99 = lc_stream.samples[(int)(lc_stream.count * 0.99)];
+
+        printf("  %-12d  %10.0fus  %10.0fus  %10.0fus  %10.0fus\n",
+               batch, bulk_p50, stream_p50, bulk_p99, stream_p99);
+
+        lat_free(&lc_bulk);
+        lat_free(&lc_stream);
+        free(feat_ids);
+        free(out_embs);
+        free(out_data);
+        free(out_dims);
+    }
+}
+
+static void bench_batch_pull_async(GravelDBClient *client) {
+    printf("\n[Batch Pull Async/Pipeline Throughput (dim=%d)]\n", DIM);
+    printf("  %-12s  %12s  %12s  %12s  %8s\n",
+           "batch_size", "ops/sec", "features/sec", "MB/sec", "depth");
+    printf("  %-12s  %12s  %12s  %12s  %8s\n",
+           "----------", "-------", "------------", "------", "-----");
+
+    int prepop = NUM_FEATURES;
+    uint64_t rng_state = 77777;
+
+    for (int bi = 0; bi < NUM_BATCH_SIZES; bi++) {
+        int batch = BATCH_SIZES[bi];
+        if (batch > MAX_WIRE_BATCH) break;
+
+        /* Allocate output buffers */
+        uint64_t *feat_ids = (uint64_t *)malloc(batch * sizeof(uint64_t));
+        float **out_embs = (float **)malloc(batch * sizeof(float *));
+        float *out_data = (float *)malloc(batch * DIM * sizeof(float));
+        int *out_dims = (int *)malloc(batch * sizeof(int));
+
+        for (int i = 0; i < batch; i++) {
+            out_embs[i] = out_data + i * DIM;
+        }
+
+        /* Determine pipeline depth: fill ~2MB of in-flight data */
+        size_t resp_size = (size_t)batch * DIM * sizeof(float);
+        int depth = (int)(2 * 1024 * 1024 / (resp_size + 1));
+        if (depth < 2) depth = 2;
+        if (depth > 64) depth = 64;
+
+        /* Warmup: fill the pipeline */
+        for (int i = 0; i < depth; i++) {
+            for (int j = 0; j < batch; j++)
+                feat_ids[j] = (xorshift64(&rng_state) % prepop) + 1;
+            graveldb_client_pull_send(client, feat_ids, batch);
+        }
+        for (int i = 0; i < depth; i++) {
+            graveldb_client_pull_recv(client, out_embs, out_dims, batch);
+        }
+
+        fprintf(stderr, "  [bench_batch_pull_async] batch=%d, depth=%d...\r", batch, depth);
+
+        /* Measure: steady-state pipeline (send one, recv one) */
+        int iters = (batch <= 128) ? 2000 : (batch <= 2048) ? 400 : 100;
+
+        /* Prime the pipeline */
+        for (int i = 0; i < depth; i++) {
+            for (int j = 0; j < batch; j++)
+                feat_ids[j] = (xorshift64(&rng_state) % prepop) + 1;
+            graveldb_client_pull_send(client, feat_ids, batch);
+        }
+
+        double t0 = now_sec();
+        for (int i = 0; i < iters; i++) {
+            /* Recv one response */
+            graveldb_client_pull_recv(client, out_embs, out_dims, batch);
+            /* Send next request */
+            for (int j = 0; j < batch; j++)
+                feat_ids[j] = (xorshift64(&rng_state) % prepop) + 1;
+            graveldb_client_pull_send(client, feat_ids, batch);
+        }
+        /* Drain remaining */
+        for (int i = 0; i < depth; i++) {
+            graveldb_client_pull_recv(client, out_embs, out_dims, batch);
+        }
+        double elapsed = now_sec() - t0;
+
+        double ops_sec = iters / elapsed;
+        double feats_sec = (double)iters * batch / elapsed;
+        double mb_sec = feats_sec * DIM * sizeof(float) / (1024.0 * 1024.0);
+
+        printf("  %-12d  %12.0f  %12.0f  %12.1f  %8d\n",
+               batch, ops_sec, feats_sec, mb_sec, depth);
 
         free(feat_ids);
         free(out_embs);
@@ -581,16 +736,24 @@ static void bench_mixed_workload(GravelDBClient *client) {
     printf("  [running] %d ops (batch=%d each)...", total_ops, batch);
     fflush(stdout);
     int pull_count = 0, push_count = 0;
+
+    LatencyCollector lc_pull, lc_push;
+    lat_init(&lc_pull, total_ops);
+    lat_init(&lc_push, total_ops);
+
     double t0 = now_sec();
     for (int i = 0; i < total_ops; i++) {
         for (int j = 0; j < batch; j++) {
             feat_ids[j] = (xorshift64(&rng_state) % NUM_FEATURES) + 1;
         }
+        double req_t0 = now_sec();
         if ((xorshift64(&rng_state) % 100) < 80) {
             graveldb_client_pull(client, feat_ids, batch, out_embs, out_dims);
+            lat_record(&lc_pull, (now_sec() - req_t0) * 1e6);
             pull_count++;
         } else {
             graveldb_client_push(client, feat_ids, dims, (const float *const *)embeddings, batch);
+            lat_record(&lc_push, (now_sec() - req_t0) * 1e6);
             push_count++;
         }
         if ((i + 1) % (total_ops / 5) == 0) {
@@ -610,6 +773,11 @@ static void bench_mixed_workload(GravelDBClient *client) {
     printf("  Ops/sec:       %.0f  (batch=%d each)\n", ops_sec, batch);
     printf("  Features/sec:  %.0f\n", feats_sec);
     printf("  Throughput:    %.1f MB/s\n", mb_sec);
+
+    lat_report(&lc_pull, "mixed pull (batch=32)");
+    lat_report(&lc_push, "mixed push (batch=32)");
+    lat_free(&lc_pull);
+    lat_free(&lc_push);
 
     free(feat_ids);
     free(dims);
@@ -794,6 +962,14 @@ int main(void) {
     printf("[6/8] Batch pull throughput...\n");
     fflush(stdout);
     bench_batch_pull(client);
+
+    printf("[6b/8] Batch pull async/pipeline throughput...\n");
+    fflush(stdout);
+    bench_batch_pull_async(client);
+
+    printf("[6c/8] Batch pull stream vs bulk...\n");
+    fflush(stdout);
+    bench_batch_pull_stream(client);
 
     printf("[7/8] Mixed workload...\n");
     fflush(stdout);

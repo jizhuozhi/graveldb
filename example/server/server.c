@@ -284,13 +284,13 @@ static inline bool client_has_pending_send(ClientConn *c) {
 }
 
 /*
- * Flush pending send chunks via writev. Non-blocking: sends as much as
- * the socket allows, frees fully-sent chunks, returns:
+ * Flush pending send chunks via writev (no arena reset).
+ * Returns:
  *   0  = all flushed
  *   1  = partial (EAGAIN), still has pending
  *  -1  = error (connection should be closed)
  */
-static int client_flush_send(ClientConn *c) {
+static int client_flush_send_raw(ClientConn *c) {
     while (c->send_head) {
         /* Build iovec array from chunk list (up to IOV_MAX or 64) */
         struct iovec iov[64];
@@ -326,9 +326,23 @@ static int client_flush_send(ClientConn *c) {
             }
         }
     }
-    /* All chunks flushed — reset arena to reclaim all memory in O(1) */
-    arena_reset(&c->arena);
     return 0;  /* all flushed */
+}
+
+/*
+ * Flush pending send chunks via writev. Non-blocking: sends as much as
+ * the socket allows, frees fully-sent chunks, returns:
+ *   0  = all flushed (arena reset)
+ *   1  = partial (EAGAIN), still has pending
+ *  -1  = error (connection should be closed)
+ */
+static int client_flush_send(ClientConn *c) {
+    int rc = client_flush_send_raw(c);
+    if (rc == 0) {
+        /* All chunks flushed — reset arena to reclaim all memory in O(1) */
+        arena_reset(&c->arena);
+    }
+    return rc;
 }
 
 static void response_begin(ClientConn *c, graveldb_wire_status_t status) {
@@ -468,6 +482,177 @@ static void handle_pull(GravelServer *srv, ClientConn *c, const uint8_t *body, u
     response_finish(c);
 }
 
+/*
+ * Streaming pull: sends response in chunked frames so that TCP can begin
+ * transmitting data before the entire batch is fetched. Each frame carries
+ * one chunk (up to 64 entries). Format:
+ *
+ *   Header:     [magic][OK][0xFFFFFFFF]  (sentinel body_len = streaming)
+ *   Frame 0:    [4B frame_len][4B total_count][entries...]
+ *   Frame 1..N: [4B frame_len][entries...]
+ *   Terminator: [4B 0]
+ *
+ * Entry: [4B dim][dim*4B floats]
+ */
+static void handle_pull_stream(GravelServer *srv, ClientConn *c, const uint8_t *body, uint32_t body_len) {
+    if (body_len < 4) {
+        response_begin(c, GRAVELDB_WIRE_INVALID);
+        response_finish(c);
+        return;
+    }
+
+    uint32_t count;
+    memcpy(&count, body, 4);
+
+    if (count > GRAVELDB_WIRE_MAX_BATCH || body_len < 4 + count * 8) {
+        response_begin(c, GRAVELDB_WIRE_INVALID);
+        response_finish(c);
+        return;
+    }
+
+    GravelDBCtx ctx = make_arena_ctx(&c->arena);
+
+    /* Parse all feat_ids */
+    const uint8_t *ptr = body + 4;
+    uint64_t *feat_ids = (uint64_t *)arena_alloc(&c->arena, count * sizeof(uint64_t));
+    if (!feat_ids) {
+        response_begin(c, GRAVELDB_WIRE_ERR);
+        response_finish(c);
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        memcpy(&feat_ids[i], ptr, 8);
+        ptr += 8;
+    }
+
+    /* Send streaming header: body_len = sentinel */
+    {
+        SendChunk *ch = chunk_arena_new(c);
+        if (!ch) return;
+        uint32_t magic = GRAVELDB_WIRE_MAGIC;
+        uint32_t st = (uint32_t)GRAVELDB_WIRE_OK;
+        uint32_t sentinel = GRAVELDB_WIRE_STREAM_SENTINEL;
+        memcpy(ch->data, &magic, 4);
+        memcpy(ch->data + 4, &st, 4);
+        memcpy(ch->data + 8, &sentinel, 4);
+        ch->len = GRAVELDB_WIRE_HEADER_SIZE;
+        ch->next = NULL;
+        if (c->send_tail) {
+            c->send_tail->next = ch;
+        } else {
+            c->send_head = ch;
+        }
+        c->send_tail = ch;
+    }
+
+    #define STREAM_CHUNK_SIZE 64
+    #define STREAM_MAX_DIM   1024
+
+    float  *chunk_scratch = (float *)arena_alloc(&c->arena, (size_t)STREAM_CHUNK_SIZE * STREAM_MAX_DIM * sizeof(float));
+    float **chunk_bufs    = (float **)arena_alloc(&c->arena, STREAM_CHUNK_SIZE * sizeof(float *));
+    int    *chunk_dims    = (int *)arena_alloc(&c->arena, STREAM_CHUNK_SIZE * sizeof(int));
+
+    if (!chunk_scratch || !chunk_bufs || !chunk_dims) {
+        /* Already sent header, send a zero-length terminator to close stream */
+        SendChunk *term = chunk_arena_new(c);
+        if (term) {
+            uint32_t zero = 0;
+            memcpy(term->data, &zero, 4);
+            term->len = 4;
+            term->next = NULL;
+            if (c->send_tail) c->send_tail->next = term;
+            else c->send_head = term;
+            c->send_tail = term;
+        }
+        return;
+    }
+
+    for (uint32_t i = 0; i < STREAM_CHUNK_SIZE; i++) {
+        chunk_bufs[i] = chunk_scratch + (size_t)i * STREAM_MAX_DIM;
+    }
+
+    int first_frame = 1;
+    for (uint32_t off = 0; off < count; off += STREAM_CHUNK_SIZE) {
+        uint32_t chunk_n = count - off;
+        if (chunk_n > STREAM_CHUNK_SIZE) chunk_n = STREAM_CHUNK_SIZE;
+
+        for (uint32_t i = 0; i < chunk_n; i++) {
+            chunk_dims[i] = 0;
+        }
+
+        graveldb_batch_get(srv->db, &ctx, feat_ids + off, (int)chunk_n, chunk_bufs, chunk_dims);
+
+        /* Build frame: [4B frame_len][payload...]
+         * First frame payload starts with [4B total_count] */
+        size_t payload_size = first_frame ? 4 : 0;
+        for (uint32_t i = 0; i < chunk_n; i++) {
+            payload_size += 4 + (size_t)chunk_dims[i] * sizeof(float);
+        }
+
+        size_t frame_size = 4 + payload_size; /* 4B frame_len prefix + payload */
+        SendChunk *ch = chunk_arena_new(c);
+        if (!ch) break;
+
+        /* Ensure chunk capacity */
+        if (frame_size > ch->cap) {
+            size_t new_cap = frame_size;
+            uint8_t *new_buf = (uint8_t *)arena_alloc(&c->arena, new_cap);
+            if (!new_buf) break;
+            ch->data = new_buf;
+            ch->cap = new_cap;
+        }
+
+        uint8_t *wp = ch->data;
+        uint32_t frame_len = (uint32_t)payload_size;
+        memcpy(wp, &frame_len, 4); wp += 4;
+
+        if (first_frame) {
+            memcpy(wp, &count, 4); wp += 4;
+            first_frame = 0;
+        }
+
+        for (uint32_t i = 0; i < chunk_n; i++) {
+            uint32_t d = (uint32_t)chunk_dims[i];
+            memcpy(wp, &d, 4); wp += 4;
+            if (d > 0) {
+                memcpy(wp, chunk_bufs[i], d * sizeof(float));
+                wp += d * sizeof(float);
+            }
+        }
+        ch->len = (size_t)(wp - ch->data);
+
+        /* Enqueue and try to flush immediately */
+        ch->next = NULL;
+        if (c->send_tail) {
+            c->send_tail->next = ch;
+        } else {
+            c->send_head = ch;
+        }
+        c->send_tail = ch;
+
+        /* Opportunistic flush: push data into TCP socket buffer early.
+         * Use raw version to avoid arena_reset (we still need feat_ids + scratch). */
+        client_flush_send_raw(c);
+    }
+
+    /* Send terminator frame: frame_len = 0 */
+    {
+        SendChunk *term = chunk_arena_new(c);
+        if (term) {
+            uint32_t zero = 0;
+            memcpy(term->data, &zero, 4);
+            term->len = 4;
+            term->next = NULL;
+            if (c->send_tail) c->send_tail->next = term;
+            else c->send_head = term;
+            c->send_tail = term;
+        }
+    }
+
+    #undef STREAM_CHUNK_SIZE
+    #undef STREAM_MAX_DIM
+}
+
 static void handle_push(GravelServer *srv, ClientConn *c, const uint8_t *body, uint32_t body_len) {
     if (body_len < 4) {
         response_begin(c, GRAVELDB_WIRE_INVALID);
@@ -593,7 +778,8 @@ static int process_message(GravelServer *srv, ClientConn *c) {
     const uint8_t *body = c->recv_buf + GRAVELDB_WIRE_HEADER_SIZE;
 
     switch ((graveldb_msg_type_t)msg_type) {
-        case GRAVELDB_MSG_PULL:       handle_pull(srv, c, body, body_len); break;
+        case GRAVELDB_MSG_PULL:        handle_pull(srv, c, body, body_len); break;
+        case GRAVELDB_MSG_PULL_STREAM: handle_pull_stream(srv, c, body, body_len); break;
         case GRAVELDB_MSG_PUSH:
         case GRAVELDB_MSG_DELETE:
         case GRAVELDB_MSG_FLUSH:

@@ -32,6 +32,7 @@ typedef enum {
     GRAVELDB_MSG_FLUSH      = 4,
     GRAVELDB_MSG_CHECKPOINT = 5,
     GRAVELDB_MSG_STATS      = 6,
+    GRAVELDB_MSG_PULL_STREAM = 7,  /* streaming pull: chunked response */
 
     /* Administrative / health-check (high number range) */
     GRAVELDB_MSG_PING       = 255,
@@ -52,6 +53,18 @@ typedef enum {
  *   for each:
  *     [4B dim][dim * 4B floats]  (dim=0 if not found)
  */
+
+/* Pull Stream (GRAVELDB_MSG_PULL_STREAM):
+ *   Request: same as PULL
+ *   Response: chunked streaming
+ *     Header: [magic][status][body_len=0xFFFFFFFF]
+ *     Frames: [4B frame_len][frame_data...] repeated
+ *       frame_data: [4B dim][dim*4B floats] for each entry in the chunk
+ *     Terminator: [4B frame_len=0]
+ *
+ *   The first frame begins with [4B total_count] before the entries.
+ */
+#define GRAVELDB_WIRE_STREAM_SENTINEL 0xFFFFFFFFu
 
 /* Push request body:
  *   [4B count]

@@ -40,21 +40,26 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     endif()
 endif()
 
-# Server
-add_executable(graveldb-server
-    cmd/server/server.c
-    cmd/server/main.c
-    cmd/server/io_poller.c
+# Server library (reusable without main)
+add_library(graveldb_server_lib STATIC
+    example/server/server.c
+    example/server/io_poller.c
 )
-target_link_libraries(graveldb-server graveldb_lib pthread)
-target_include_directories(graveldb-server PRIVATE include cmd/server protocol)
+target_link_libraries(graveldb_server_lib graveldb_lib pthread)
+target_include_directories(graveldb_server_lib PUBLIC example/server)
+target_include_directories(graveldb_server_lib PRIVATE include example/protocol)
+
+# Server executable
+add_executable(graveldb-server example/server/main.c)
+target_link_libraries(graveldb-server graveldb_server_lib)
+target_include_directories(graveldb-server PRIVATE include example/server example/protocol)
 
 # Client Library
 add_library(graveldb_client STATIC
-    client/client.c
+    example/client/client.c
 )
-target_include_directories(graveldb_client PUBLIC client)
-target_include_directories(graveldb_client PRIVATE include protocol)
+target_include_directories(graveldb_client PUBLIC example/client)
+target_include_directories(graveldb_client PRIVATE include example/protocol)
 
 # Tests
 add_executable(test-basic tests/test_basic.c)
@@ -83,7 +88,7 @@ target_include_directories(test-checkpoint PRIVATE src)
 
 # Benchmarks
 add_executable(bench-main tests/bench.c)
-target_link_libraries(bench-main graveldb_lib graveldb_client pthread)
+target_link_libraries(bench-main graveldb_lib pthread)
 target_include_directories(bench-main PRIVATE src)
 
 add_executable(bench-hash tests/bench_hash_compare.c)
@@ -117,13 +122,13 @@ add_executable(bench-memory-scaling tests/bench_memory_scaling.c)
 target_link_libraries(bench-memory-scaling graveldb_lib pthread m)
 target_include_directories(bench-memory-scaling PRIVATE src)
 
-add_executable(bench-network tests/bench_network.c)
-target_link_libraries(bench-network graveldb_client pthread m)
-target_include_directories(bench-network PRIVATE client)
+add_executable(bench-network example/bench/bench_network.c)
+target_link_libraries(bench-network graveldb_client graveldb_server_lib m)
+target_include_directories(bench-network PRIVATE example/client example/server include example/protocol)
 
-add_executable(bench-network-scale tests/bench_network_scale.c)
+add_executable(bench-network-scale example/bench/bench_network_scale.c)
 target_link_libraries(bench-network-scale graveldb_client pthread m)
-target_include_directories(bench-network-scale PRIVATE client)
+target_include_directories(bench-network-scale PRIVATE example/client)
 
 # CTest
 enable_testing()
@@ -138,5 +143,5 @@ add_test(NAME checkpoint    COMMAND test-checkpoint)
 install(TARGETS graveldb-server DESTINATION bin)
 install(TARGETS graveldb_lib graveldb_client DESTINATION lib)
 install(FILES include/graveldb.h DESTINATION include/graveldb)
-install(FILES protocol/graveldb_wire.h DESTINATION include/graveldb)
-install(FILES client/client.h DESTINATION include/graveldb)
+install(FILES example/protocol/graveldb_wire.h DESTINATION include/graveldb)
+install(FILES example/client/client.h DESTINATION include/graveldb)

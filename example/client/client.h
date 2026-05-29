@@ -53,7 +53,23 @@ int graveldb_client_push_async(GravelDBClient *client,
                                const int *dims,
                                const float *const *embeddings, int n);
 
-/* Drain up to max_drain pending responses (0 = drain all).
+/* Pull async (pipelined):
+ * pull_send: send pull request without reading response.
+ * pull_recv: receive one pending pull response into caller's buffers.
+ * Use these to overlap multiple pull requests in the TCP pipeline. */
+int graveldb_client_pull_send(GravelDBClient *client,
+                              const uint64_t *feat_ids, int n);
+int graveldb_client_pull_recv(GravelDBClient *client,
+                              float **out_embeddings, int *out_dims, int n);
+
+/* Streaming pull: server sends data in chunks as it becomes available.
+ * Reduces first-byte latency for large batches compared to bulk pull.
+ * Same interface as graveldb_client_pull. */
+int graveldb_client_pull_stream(GravelDBClient *client,
+                                const uint64_t *feat_ids, int n,
+                                float **out_embeddings, int *out_dims);
+
+/* Drain up to max_drain pending async responses (0 = drain all).
  * Returns number of errors, or -1 on connection failure. */
 int graveldb_client_await(GravelDBClient *client, int max_drain);
 
