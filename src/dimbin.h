@@ -113,6 +113,11 @@ typedef struct DimBin {
     uint64_t    total_entries;
     uint64_t    total_pages;
     uint64_t    io_errors;       /* cumulative I/O error count (non-fatal) */
+
+    /* Tracked file sizes: avoid per-entry fstat syscalls.
+     * Updated on init (from fstat) and on ftruncate. */
+    size_t      data_file_size;
+    size_t      key_file_size;
 } DimBin;
 
 /*
@@ -123,6 +128,7 @@ graveldb_status_t dimbin_init(DimBin *s, int dim, const char *file_path,
                                size_t buffer_size, uint32_t entry_align,
                                uint32_t page_size);
 void dimbin_destroy(DimBin *s);
+void dimbin_reserve(DimBin *s, uint32_t count);
 uint32_t dimbin_alloc_entry(DimBin *s);
 void dimbin_free_entry(DimBin *s, uint32_t entry_idx);
 graveldb_status_t dimbin_get(DimBin *s, uint32_t entry_id, float *buf);

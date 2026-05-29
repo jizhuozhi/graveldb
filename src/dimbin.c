@@ -98,6 +98,7 @@ graveldb_status_t dimbin_init(DimBin *s, int dim, const char *file_path,
 
     struct stat st;
     if (fstat(s->fd, &st) < 0) { rc = GRAVELDB_ERR_IO; goto fail; }
+    s->data_file_size = (size_t)st.st_size;
 
     if (st.st_size > 0) {
         s->bump_ptr = st.st_size / s->entry_size;
@@ -107,6 +108,14 @@ graveldb_status_t dimbin_init(DimBin *s, int dim, const char *file_path,
         s->total_entries = 0;
     }
     s->total_pages = (s->total_entries + s->entries_per_page - 1) / s->entries_per_page;
+
+    /* Track key file size */
+    struct stat kst;
+    if (fstat(s->key_fd, &kst) == 0) {
+        s->key_file_size = (size_t)kst.st_size;
+    } else {
+        s->key_file_size = 0;
+    }
 
     s->free_capacity = 1024;
     s->free_list = (uint32_t *)malloc(s->free_capacity * sizeof(uint32_t));
@@ -187,29 +196,58 @@ void dimbin_destroy(DimBin *s) {
     s->key_fd = -1;
 }
 
+/* Pre-reserve file space for `count` new bump-alloc entries.
+ * Call once before a batch loop so that individual dimbin_alloc_entry
+ * calls never hit the ftruncate path. Only grows; never shrinks. */
+void dimbin_reserve(DimBin *s, uint32_t count) {
+    uint64_t future_bump = s->bump_ptr + count;
+    size_t required_bytes = (size_t)future_bump * s->entry_size;
+    if (s->data_file_size < required_bytes) {
+        size_t new_size = s->data_file_size > 0 ? s->data_file_size * 2 : (size_t)s->page_size * 256;
+        while (new_size < required_bytes) new_size *= 2;
+        if (ftruncate(s->fd, new_size) == 0) {
+            s->data_file_size = new_size;
+        } else if (ftruncate(s->fd, required_bytes) == 0) {
+            s->data_file_size = required_bytes;
+        }
+    }
+    size_t key_required = (size_t)future_bump * sizeof(uint64_t);
+    if (s->key_file_size < key_required) {
+        size_t new_key_size = s->key_file_size > 0 ? s->key_file_size * 2 : 8192;
+        while (new_key_size < key_required) new_key_size *= 2;
+        if (ftruncate(s->key_fd, new_key_size) == 0) {
+            s->key_file_size = new_key_size;
+        }
+    }
+}
+
 uint32_t dimbin_alloc_entry(DimBin *s) {
     if (s->free_count > 0) {
         return s->free_list[--s->free_count];
     }
     uint32_t slot = (uint32_t)(s->bump_ptr++);
 
-    size_t required_bytes = (slot + 1) * s->entry_size;
-    struct stat st;
-    if (fstat(s->fd, &st) == 0 && (size_t)st.st_size < required_bytes) {
-        size_t new_size = st.st_size > 0 ? (size_t)st.st_size * 2 : s->page_size * 256;
+    /* Grow data file if needed (no fstat -- use tracked size).
+     * If dimbin_reserve() was called beforehand, this never triggers. */
+    size_t required_bytes = (size_t)(slot + 1) * s->entry_size;
+    if (__builtin_expect(s->data_file_size < required_bytes, 0)) {
+        size_t new_size = s->data_file_size > 0 ? s->data_file_size * 2 : (size_t)s->page_size * 256;
         if (new_size < required_bytes) new_size = required_bytes * 2;
-        if (ftruncate(s->fd, new_size) < 0) {
-            /* Fallback: try exact size. Even if this fails, pwrite extends the file. */
-            (void)ftruncate(s->fd, required_bytes);
+        if (ftruncate(s->fd, new_size) == 0) {
+            s->data_file_size = new_size;
+        } else if (ftruncate(s->fd, required_bytes) == 0) {
+            s->data_file_size = required_bytes;
         }
     }
 
+    /* Grow key file if needed */
     size_t key_required = (size_t)(slot + 1) * sizeof(uint64_t);
-    if (fstat(s->key_fd, &st) == 0 && (size_t)st.st_size < key_required) {
-        size_t new_key_size = st.st_size > 0 ? (size_t)st.st_size * 2 : 8192;
+    if (__builtin_expect(s->key_file_size < key_required, 0)) {
+        size_t new_key_size = s->key_file_size > 0 ? s->key_file_size * 2 : 8192;
         if (new_key_size < key_required) new_key_size = key_required * 2;
-        /* Best-effort pre-allocation; pwrite will extend the file anyway */
-        (void)ftruncate(s->key_fd, new_key_size);
+        if (ftruncate(s->key_fd, new_key_size) == 0) {
+            s->key_file_size = new_key_size;
+        }
     }
 
     if (slot >= s->total_entries) {
@@ -258,6 +296,40 @@ graveldb_status_t dimbin_put_key(DimBin *s, uint32_t entry_idx, uint64_t feat_id
 #define KEYS_PER_PAGE       (KEY_PAGE_SIZE / sizeof(uint64_t))  /* 512 */
 /* KEY_COALESCE_THRESH defined in dimbin.h */
 
+static inline void flush_key_page(DimBin *s, uint8_t *page_buf,
+                                   uint32_t page_id,
+                                   const uint32_t *slots, const uint64_t *vals,
+                                   int count) {
+    if (count >= KEY_COALESCE_THRESH) {
+        /* Read-modify-write: load page, patch slots, write back */
+        off_t pg_off = (off_t)page_id * KEY_PAGE_SIZE;
+        if ((size_t)pg_off < s->key_file_size) {
+            ssize_t rd = pread(s->key_fd, page_buf, KEY_PAGE_SIZE, pg_off);
+            if (rd < KEY_PAGE_SIZE) {
+                if (rd < 0) rd = 0;
+                memset(page_buf + rd, 0, KEY_PAGE_SIZE - (size_t)rd);
+            }
+        } else {
+            memset(page_buf, 0, KEY_PAGE_SIZE);
+        }
+        uint64_t *kp = (uint64_t *)page_buf;
+        for (int k = 0; k < count; k++) {
+            kp[slots[k]] = vals[k];
+        }
+        if (pwrite(s->key_fd, page_buf, KEY_PAGE_SIZE, pg_off) != KEY_PAGE_SIZE) {
+            s->io_errors++;
+        }
+    } else {
+        /* Sparse: individual 8-byte writes */
+        for (int k = 0; k < count; k++) {
+            off_t off = (off_t)(page_id * KEYS_PER_PAGE + slots[k]) * sizeof(uint64_t);
+            if (pwrite(s->key_fd, &vals[k], sizeof(uint64_t), off) != sizeof(uint64_t)) {
+                s->io_errors++;
+            }
+        }
+    }
+}
+
 void dimbin_put_keys_batch(DimBin *s, const KeyWriteEntry *entries, int count) {
     if (count == 0) return;
 
@@ -282,42 +354,13 @@ void dimbin_put_keys_batch(DimBin *s, const KeyWriteEntry *entries, int count) {
     uint64_t page_vals[KEYS_PER_PAGE]; /* feat_id for each accumulated key */
     int page_count = 0;
 
-    /* Flush helper: write accumulated keys for one page */
-    #define FLUSH_KEY_PAGE() do { \
-        if (page_count >= KEY_COALESCE_THRESH) { \
-            /* Read-modify-write: pread page, patch, pwrite */ \
-            off_t pg_off = (off_t)cur_page * KEY_PAGE_SIZE; \
-            ssize_t rd = pread(s->key_fd, page_buf, KEY_PAGE_SIZE, pg_off); \
-            if (rd < KEY_PAGE_SIZE) { \
-                /* Partial/short read: zero-fill remainder */ \
-                if (rd < 0) rd = 0; \
-                memset(page_buf + rd, 0, KEY_PAGE_SIZE - rd); \
-            } \
-            uint64_t *kp = (uint64_t *)page_buf; \
-            for (int _k = 0; _k < page_count; _k++) { \
-                kp[page_keys[_k]] = page_vals[_k]; \
-            } \
-            if (pwrite(s->key_fd, page_buf, KEY_PAGE_SIZE, pg_off) != KEY_PAGE_SIZE) { \
-                s->io_errors++; \
-            } \
-        } else { \
-            /* Sparse: individual 8-byte writes */ \
-            for (int _k = 0; _k < page_count; _k++) { \
-                off_t off = (off_t)(cur_page * KEYS_PER_PAGE + page_keys[_k]) * sizeof(uint64_t); \
-                if (pwrite(s->key_fd, &page_vals[_k], sizeof(uint64_t), off) != sizeof(uint64_t)) { \
-                    s->io_errors++; \
-                } \
-            } \
-        } \
-        page_count = 0; \
-    } while(0)
-
     for (int i = 0; i < count; i++) {
         uint32_t pg = entries[i].entry_idx / KEYS_PER_PAGE;
         uint32_t slot = entries[i].entry_idx % KEYS_PER_PAGE;
 
         if (pg != cur_page) {
-            FLUSH_KEY_PAGE();
+            flush_key_page(s, page_buf, cur_page, page_keys, page_vals, page_count);
+            page_count = 0;
             cur_page = pg;
         }
 
@@ -328,10 +371,8 @@ void dimbin_put_keys_batch(DimBin *s, const KeyWriteEntry *entries, int count) {
 
     /* Flush remaining */
     if (page_count > 0) {
-        FLUSH_KEY_PAGE();
+        flush_key_page(s, page_buf, cur_page, page_keys, page_vals, page_count);
     }
-
-    #undef FLUSH_KEY_PAGE
 }
 
 void dimbin_free_entry(DimBin *s, uint32_t entry_idx) {
@@ -384,12 +425,19 @@ static uint8_t *write_buf_ensure_page(DimBin *s, uint32_t page_id) {
     void *mem = slab_alloc_aligned(s->allocator, s->page_size, 4096);
     if (!mem) return NULL;
 
-    /* Load existing data from disk for partial-page writes */
-    ssize_t rd = pread(s->fd, mem, s->page_size, (off_t)page_id * s->page_size);
-    if (rd < (ssize_t)s->page_size) {
-        /* Short read (new/sparse file): zero-fill remainder */
-        if (rd < 0) rd = 0;
-        memset((uint8_t *)mem + rd, 0, s->page_size - (size_t)rd);
+    /* Load existing data from disk for partial-page writes.
+     * Optimization: if the page is beyond current file size (freshly bump-allocated),
+     * skip pread entirely -- just zero-fill. This eliminates syscalls for the common
+     * batch-insert path where all pages are new. */
+    off_t page_offset = (off_t)page_id * s->page_size;
+    if ((size_t)page_offset < s->data_file_size) {
+        ssize_t rd = pread(s->fd, mem, s->page_size, page_offset);
+        if (rd < (ssize_t)s->page_size) {
+            if (rd < 0) rd = 0;
+            memset((uint8_t *)mem + rd, 0, s->page_size - (size_t)rd);
+        }
+    } else {
+        memset(mem, 0, s->page_size);
     }
 
     wb->slots[idx].page_id = page_id;

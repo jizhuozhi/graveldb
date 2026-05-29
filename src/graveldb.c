@@ -700,6 +700,10 @@ graveldb_status_t graveldb_batch_put(GravelDB *db, GravelDBCtx *ctx,
             /* If alloc fails, fall through to per-key pwrite path */
         }
 
+        /* Pre-reserve file space for the worst case (all new features).
+         * This ensures dimbin_alloc_entry never hits ftruncate in the loop. */
+        dimbin_reserve(bin, (uint32_t)group_size);
+
         for (int g = 0; g < group_size; g++) {
             int orig_idx = order[group_start + g];
             uint64_t feat_id = feat_ids[orig_idx];
