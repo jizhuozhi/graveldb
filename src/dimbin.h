@@ -1,7 +1,7 @@
 /*
  * GravelDB - DimBin (per-dimension storage bin)
  *
- * Self-contained module: defines WriteBuffer, ReadCache, DimBin and all
+ * Self-contained module: defines WriteBuffer, DimBin and all
  * dimbin operations. Depends on its sub-components directly.
  */
 
@@ -15,7 +15,6 @@
 #include "dirty_tracker.h"
 #include "overlay.h"
 #include "slab_alloc.h"
-#include "tinylfu.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -57,23 +56,6 @@ typedef struct {
     uint32_t    rng_state;      /* xorshift32 for random page sampling */
 } WriteBuffer;
 
-/*
- * ReadCache: open-addressing hashmap + TinyLFU admission.
- * Eviction uses sampled-LFU: pick N random candidates, evict lowest freq.
- * Memory proportional to actual cached page count.
- */
-typedef struct {
-    PageSlot   *slots;
-    uint32_t    capacity;       /* hash table capacity (power of 2) */
-    uint32_t    count;          /* number of occupied slots */
-    size_t      max_pages;      /* max resident pages */
-    TinyLFU     lfu;            /* admission + frequency tracking */
-    uint32_t    rng_state;      /* xorshift32 for random sampling */
-    uint64_t    hits;
-    uint64_t    misses;
-    uint64_t    evictions;
-} ReadCache;
-
 typedef struct DimBin {
     int         dim;
     uint32_t    page_size;
@@ -89,7 +71,6 @@ typedef struct DimBin {
     uint32_t    free_capacity;
     DirtyTracker dirty;
     WriteBuffer write_buf;
-    ReadCache   read_cache;
     OverlayBuffer overlay;
     bool      in_checkpoint;
     uint32_t   *flush_dirty_buf;

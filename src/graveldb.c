@@ -900,29 +900,22 @@ graveldb_status_t graveldb_stats(GravelDB *db, GravelDBStats *stats) {
     stats->total_features = db->index.count;
     stats->checkpoint_generation = db->current_epoch;
 
-    uint64_t total_hits = 0, total_misses = 0;
-    uint64_t total_evictions = 0, total_flush = 0;
+    uint64_t total_flush = 0;
     uint64_t total_entries = 0;
 
     uint16_t num_slabs = dim_registry_count(&db->dim_reg);
     for (uint16_t i = 0; i < num_slabs; i++) {
         DimBin *s = dim_registry_get_bin(&db->dim_reg, i);
-        total_hits += s->read_cache.hits;
-        total_misses += s->read_cache.misses;
-        total_evictions += s->read_cache.evictions;
         total_flush += s->write_buf.flush_bytes;
         total_entries += s->bump_ptr;
     }
 
     stats->total_entries = total_entries;
-    stats->buffer_hits = total_hits;
-    stats->buffer_misses = total_misses;
-    stats->buffer_evictions = total_evictions;
+    stats->buffer_hits = 0;
+    stats->buffer_misses = 0;
+    stats->buffer_evictions = 0;
     stats->flush_bytes = total_flush;
-
-    if (total_hits + total_misses > 0) {
-        stats->cache_hit_ratio = (float)total_hits / (float)(total_hits + total_misses);
-    }
+    stats->cache_hit_ratio = 0.0f;
 
     return GRAVELDB_OK;
 }

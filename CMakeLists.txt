@@ -18,7 +18,6 @@ add_library(graveldb_lib STATIC
     src/dirty_tracker.c
     src/overlay.c
     src/dimbin.c
-    src/tinylfu.c
     src/slab_alloc.c
     src/dim_registry.c
     src/checkpoint.c
@@ -36,6 +35,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_compile_definitions(graveldb_lib PUBLIC GRAVELDB_USE_IO_URING=1)
         message(STATUS "Found liburing: ${LIBURING} - io_uring flush enabled")
     else()
+        target_compile_definitions(graveldb_lib PUBLIC GRAVELDB_USE_IO_URING=0)
         message(STATUS "liburing not found - using pwrite+fdatasync fallback")
     endif()
 endif()
@@ -68,10 +68,6 @@ target_include_directories(test-hash-index PRIVATE src)
 add_executable(test-slab-alloc tests/test_slab_alloc.c)
 target_link_libraries(test-slab-alloc graveldb_lib pthread)
 target_include_directories(test-slab-alloc PRIVATE src)
-
-add_executable(test-tinylfu tests/test_tinylfu.c)
-target_link_libraries(test-tinylfu graveldb_lib pthread)
-target_include_directories(test-tinylfu PRIVATE src)
 
 add_executable(test-dim-registry tests/test_dim_registry.c)
 target_link_libraries(test-dim-registry graveldb_lib pthread)
@@ -130,7 +126,6 @@ enable_testing()
 add_test(NAME basic         COMMAND test-basic)
 add_test(NAME hash-index    COMMAND test-hash-index)
 add_test(NAME slab-alloc    COMMAND test-slab-alloc)
-add_test(NAME tinylfu       COMMAND test-tinylfu)
 add_test(NAME dim-registry  COMMAND test-dim-registry)
 add_test(NAME integration   COMMAND test-integration)
 add_test(NAME checkpoint    COMMAND test-checkpoint)

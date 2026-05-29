@@ -1,18 +1,19 @@
 /*
  * GravelDB - Memory Scaling Benchmark
  *
- * Measures the speedup ratio as available memory (ReadCache) increases
- * relative to total data size. This answers the question:
- *   "Given N MB of data on NVMe, how much does M MB of cache help?"
+ * Measures the speedup ratio as available buffer memory (WriteBuffer)
+ * increases relative to total data size. With read cache removed,
+ * reads rely on OS page cache; this benchmark now primarily measures
+ * the impact of write buffer size on mixed workloads.
  *
  * Test matrix:
  *   - Data sizes: 64MB, 256MB, 1GB (configurable)
- *   - Cache ratios: 5%, 10%, 25%, 50%, 75%, 100% of data size
+ *   - Buffer ratios: 5%, 10%, 25%, 50%, 75%, 100% of data size
  *   - Access patterns: Zipfian (θ=0.99), Uniform, Hotspot (80/20)
- *   - Metrics: ops/s, avg latency (ns), p99 latency, cache hit ratio
+ *   - Metrics: ops/s, avg latency (ns), p99 latency
  *
  * The benchmark creates real data on disk and exercises the full
- * dimbin_get path (write_buf forwarding → read_cache hit → NVMe pread).
+ * dimbin_get path (write_buf forwarding → OS page cache / pread).
  */
 
 #define _XOPEN_SOURCE 700
@@ -243,7 +244,7 @@ static BenchResult run_bench(int num_features, int dim, size_t buffer_size,
     graveldb_flush(db);
     graveldb_close(db);
 
-    /* Phase 2: Reopen with target buffer_size (controls ReadCache size) */
+    /* Phase 2: Reopen with target buffer_size (controls WriteBuffer size) */
     config.buffer_size = buffer_size;
     rc = graveldb_open(&db, &config);
     if (rc != GRAVELDB_OK) {
@@ -258,21 +259,10 @@ static BenchResult run_bench(int num_features, int dim, size_t buffer_size,
     LatencyHist hist;
     hist_init(&hist);
 
-    /* Warm-up: 10% of queries to stabilize TinyLFU frequency estimates */
+    /* Warm-up: run 10% of queries to warm OS page cache */
     int warmup_count = num_queries / 10;
     for (int i = 0; i < warmup_count; i++) {
         graveldb_get(db, NULL, query_ids[i % num_queries], out, &out_dim);
-    }
-
-    /* Reset stats after warmup */
-    {
-        uint16_t num_bins = dim_registry_count(&db->dim_reg);
-        for (uint16_t i = 0; i < num_bins; i++) {
-            DimBin *s = dim_registry_get_bin(&db->dim_reg, i);
-            s->read_cache.hits = 0;
-            s->read_cache.misses = 0;
-            s->read_cache.evictions = 0;
-        }
     }
 
     /* Measured run */
@@ -347,8 +337,8 @@ static void run_scaling_suite(int num_features, int dim, int num_queries) {
         printf("  ──────────┼────────────┼────────────┼──────────┼──────────┼──────────┼──────────┼────────\n");
 
         for (int r = 0; r < num_ratios; r++) {
-            /* buffer_size controls total page budget (write_buf + read_cache).
-             * ReadCache gets 3/4 of it. */
+            /* buffer_size controls total page budget for WriteBuffer.
+             * Reads rely on OS page cache. */
             size_t buffer_size = (size_t)(total_data_bytes * ratios[r]);
             if (buffer_size < 512 * 1024) buffer_size = 512 * 1024; /* min 512KB */
             double cache_mb = (double)buffer_size / (1024.0 * 1024.0);

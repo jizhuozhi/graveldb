@@ -102,9 +102,6 @@ graveldb_status_t dimbin_flush(DimBin *s);
 static inline bool dimbin_should_flush(DimBin *s);
 static void dimbin_proactive_flush(DimBin *s);
 static uint8_t *write_buf_ensure_page(DimBin *s, uint32_t page_id);
-static uint8_t *read_cache_get(DimBin *s, uint32_t page_id);
-static uint8_t *read_cache_load(DimBin *s, uint32_t page_id);
-static void read_cache_evict(DimBin *s);
 
 graveldb_status_t dimbin_init(DimBin *s, int dim, const char *file_path,
                                size_t buffer_size, uint32_t entry_align,
@@ -165,10 +162,8 @@ graveldb_status_t dimbin_init(DimBin *s, int dim, const char *file_path,
     size_t max_pgs = buffer_size / s->page_size;
     if (max_pgs == 0) max_pgs = 1024;
 
-    /* Split budget: 3/4 to read cache, 1/4 to write buffer */
-    size_t write_max = max_pgs / 4;
+    size_t write_max = max_pgs;
     if (write_max == 0) write_max = 64;
-    size_t read_max = max_pgs - write_max;
 
     /* Initialize WriteBuffer (hashmap) */
     s->write_buf.max_pages = write_max;
@@ -185,23 +180,6 @@ graveldb_status_t dimbin_init(DimBin *s, int dim, const char *file_path,
         s->write_buf.slots[i].data = NULL;
     }
 
-    /* Initialize ReadCache (hashmap + TinyLFU) */
-    s->read_cache.max_pages = read_max;
-    s->read_cache.count = 0;
-    uint32_t rc_cap = 64;
-    while (rc_cap < read_max * 2) rc_cap *= 2;
-    s->read_cache.capacity = rc_cap;
-    s->read_cache.slots = (PageSlot *)malloc(rc_cap * sizeof(PageSlot));
-    if (!s->read_cache.slots) { rc = GRAVELDB_ERR_OOM; goto fail; }
-    for (uint32_t i = 0; i < rc_cap; i++) {
-        s->read_cache.slots[i].page_id = PAGE_SLOT_EMPTY;
-        s->read_cache.slots[i].data = NULL;
-    }
-    /* TinyLFU: CMS width = 4x cache capacity for good accuracy */
-    rc = tinylfu_init(&s->read_cache.lfu, rc_cap * 2, 1);
-    if (rc != GRAVELDB_OK) goto fail;
-    s->read_cache.rng_state = 12345;  /* deterministic seed */
-
     s->flush_dirty_buf = (uint32_t *)malloc(GRAVELDB_MAX_FLUSH_BATCH * sizeof(uint32_t));
     if (!s->flush_dirty_buf) { rc = GRAVELDB_ERR_OOM; goto fail; }
 
@@ -217,8 +195,6 @@ fail:
     free(s->free_list);
     dirty_tracker_destroy(&s->dirty);
     free(s->write_buf.slots);
-    free(s->read_cache.slots);
-    tinylfu_destroy(&s->read_cache.lfu);
     free(s->flush_dirty_buf);
     memset(s, 0, sizeof(*s));
     s->fd = -1;
@@ -243,17 +219,6 @@ void dimbin_destroy(DimBin *s) {
         }
         free(s->write_buf.slots);
     }
-
-    /* Free ReadCache pages */
-    if (s->read_cache.slots) {
-        for (uint32_t i = 0; i < s->read_cache.capacity; i++) {
-            if (s->read_cache.slots[i].page_id != PAGE_SLOT_EMPTY && s->read_cache.slots[i].data) {
-                slab_free_aligned(s->allocator, s->read_cache.slots[i].data, s->page_size);
-            }
-        }
-        free(s->read_cache.slots);
-    }
-    tinylfu_destroy(&s->read_cache.lfu);
 
     free(s->flush_dirty_buf);
 
@@ -426,120 +391,6 @@ void dimbin_free_entry(DimBin *s, uint32_t entry_idx) {
 }
 
 /*
- * ReadCache: Sampled-LFU eviction.
- * Sample N random slots from hashmap, evict the one with lowest TinyLFU frequency.
- * No I/O needed -- pages are always clean in read cache.
- */
-#define EVICT_SAMPLE_COUNT 5
-
-static void read_cache_evict(DimBin *s) {
-    ReadCache *rc = &s->read_cache;
-    if (rc->count == 0) return;
-
-    /* Sample EVICT_SAMPLE_COUNT occupied slots, pick lowest freq */
-    uint32_t best_idx = UINT32_MAX;
-    uint8_t  best_freq = UINT8_MAX;
-    int found = 0;
-    uint32_t mask = rc->capacity - 1;
-
-    for (int attempts = 0; attempts < (int)rc->capacity && found < EVICT_SAMPLE_COUNT; attempts++) {
-        uint32_t idx = xorshift32(&rc->rng_state) & mask;
-        if (rc->slots[idx].page_id == PAGE_SLOT_EMPTY) continue;
-
-        uint8_t freq = tinylfu_estimate(&rc->lfu, (uint64_t)rc->slots[idx].page_id);
-        if (freq < best_freq) {
-            best_freq = freq;
-            best_idx = idx;
-        }
-        found++;
-    }
-
-    if (best_idx == UINT32_MAX) return;
-
-    /* Evict: no I/O needed -- page is always clean in read cache */
-    slab_free_aligned(s->allocator, rc->slots[best_idx].data, s->page_size);
-    pagemap_remove(rc->slots, rc->capacity, best_idx);
-    rc->count--;
-    rc->evictions++;
-}
-
-/*
- * ReadCache: load a page from disk into read cache with TinyLFU admission.
- * Returns pointer to cached page data, or NULL on failure.
- */
-static uint8_t *read_cache_load(DimBin *s, uint32_t page_id) {
-    ReadCache *rc = &s->read_cache;
-
-    /* Record access for frequency estimation */
-    tinylfu_access(&rc->lfu, (uint64_t)page_id);
-
-    /* Admission check: compare new page freq vs a random victim */
-    if (rc->count >= rc->max_pages) {
-        /* Find a candidate victim to compare against */
-        uint32_t mask = rc->capacity - 1;
-        uint32_t victim_idx = UINT32_MAX;
-        for (int attempts = 0; attempts < (int)rc->capacity; attempts++) {
-            uint32_t idx = xorshift32(&rc->rng_state) & mask;
-            if (rc->slots[idx].page_id != PAGE_SLOT_EMPTY) {
-                victim_idx = idx;
-                break;
-            }
-        }
-        if (victim_idx != UINT32_MAX) {
-            uint8_t new_freq = tinylfu_estimate(&rc->lfu, (uint64_t)page_id);
-            uint8_t victim_freq = tinylfu_estimate(&rc->lfu, (uint64_t)rc->slots[victim_idx].page_id);
-            if (new_freq < victim_freq) {
-                /* New page has lower frequency -- reject admission */
-                return NULL;
-            }
-        }
-        /* Evict to make room */
-        read_cache_evict(s);
-    }
-
-    /* Grow hashmap if load factor too high (>70%) */
-    if (rc->count * 10 >= rc->capacity * 7) {
-        uint32_t new_cap = rc->capacity * 2;
-        PageSlot *new_slots = pagemap_grow(rc->slots, rc->capacity, new_cap);
-        if (!new_slots) return NULL;
-        rc->slots = new_slots;
-        rc->capacity = new_cap;
-    }
-
-    /* Allocate page and read from disk */
-    void *mem = slab_alloc_aligned(s->allocator, s->page_size, 4096);
-    if (!mem) return NULL;
-
-    ssize_t rd = pread(s->fd, mem, s->page_size, (off_t)page_id * s->page_size);
-    if (rd < 0) {
-        slab_free_aligned(s->allocator, mem, s->page_size);
-        return NULL;
-    }
-
-    /* Insert into hashmap */
-    uint32_t idx = pagemap_find(rc->slots, rc->capacity, page_id);
-    rc->slots[idx].page_id = page_id;
-    rc->slots[idx].data = (uint8_t *)mem;
-    rc->count++;
-
-    return (uint8_t *)mem;
-}
-
-/*
- * ReadCache: get a page if already cached (no disk I/O).
- */
-static uint8_t *read_cache_get(DimBin *s, uint32_t page_id) {
-    ReadCache *rc = &s->read_cache;
-    uint32_t idx = pagemap_find(rc->slots, rc->capacity, page_id);
-    if (rc->slots[idx].page_id == page_id) {
-        tinylfu_access(&rc->lfu, (uint64_t)page_id);
-        rc->hits++;
-        return rc->slots[idx].data;
-    }
-    return NULL;
-}
-
-/*
  * WriteBuffer: ensure a page exists in the write buffer.
  * If the page doesn't exist yet, allocate it and optionally load from disk
  * to support partial-page writes.
@@ -608,26 +459,10 @@ graveldb_status_t dimbin_get(DimBin *s, uint32_t entry_id, float *buf) {
         return GRAVELDB_OK;
     }
 
-    /* 2. Check read cache */
-    uint8_t *cached = read_cache_get(s, page_id);
-    if (cached) {
-        memcpy(buf, cached + offset_in_page, s->entry_size);
-        return GRAVELDB_OK;
-    }
-
-    /* 3. Cache miss: load into read cache */
-    uint8_t *loaded = read_cache_load(s, page_id);
-    if (loaded) {
-        memcpy(buf, loaded + offset_in_page, s->entry_size);
-        s->read_cache.misses++;
-        return GRAVELDB_OK;
-    }
-
-    /* 4. Fallback: direct pread (if read cache is full/failed) */
+    /* 2. Direct pread fallback */
     off_t offset = (off_t)entry_id * s->entry_size;
     ssize_t rd = pread(s->fd, buf, s->entry_size, offset);
     if (rd < 0) return GRAVELDB_ERR_IO;
-    s->read_cache.misses++;
     return GRAVELDB_OK;
 }
 
@@ -649,15 +484,6 @@ graveldb_status_t dimbin_put(DimBin *s, uint32_t entry_id, const float *data) {
     if (page) {
         memcpy(page + offset_in_page, data, s->entry_size);
         dirty_tracker_mark(&s->dirty, page_id);
-
-        /* Also invalidate read cache for this page (stale) */
-        ReadCache *rc = &s->read_cache;
-        uint32_t rc_idx = pagemap_find(rc->slots, rc->capacity, page_id);
-        if (rc->slots[rc_idx].page_id == page_id) {
-            slab_free_aligned(s->allocator, rc->slots[rc_idx].data, s->page_size);
-            pagemap_remove(rc->slots, rc->capacity, rc_idx);
-            rc->count--;
-        }
 
         /* Water-level check */
         if (dimbin_should_flush(s)) {

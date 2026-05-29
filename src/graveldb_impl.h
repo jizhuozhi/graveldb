@@ -14,8 +14,8 @@
  *   - Sub-module .c files include their own .h, NOT this file.
  *
  * Build cache benefit:
- *   Modifying e.g. TinyLFU internals now only rebuilds tinylfu.c and files
- *   that truly depend on TinyLFU -- not all translation units.
+ *   Modifying a sub-module only rebuilds that .c and files that truly
+ *   depend on it -- not all translation units.
  */
 
 #ifndef GRAVELDB_IMPL_H_
