@@ -1,20 +1,12 @@
 /*
- * GravelDB - io_uring batch flush support
+ * GravelDB - io_uring batch I/O (multi-fd writes + batch reads)
  *
- * On Linux with io_uring (kernel 5.1+), flush submits all block writes as a
- * single batch into the submission queue, achieving:
- *   - 0-1 syscalls for N writes (vs N pwrite syscalls)
- *   - Full NVMe queue depth utilization
- *   - Kernel-side I/O merging of adjacent submissions
+ * Supports:
+ *   - Multi-fd batch write: submit writes across different file descriptors
+ *     in a single io_uring ring, with per-fd fsync at the end.
+ *   - Batch read: submit multiple pread requests across fds, wait all.
  *
- * On macOS / older Linux: transparent fallback to pwrite loop.
- *
- * Usage:
- *   uring_flush_ctx_t ctx;
- *   uring_flush_init(&ctx, fd);
- *   uring_flush_submit(&ctx, buf, size, offset);  // repeat N times
- *   uring_flush_wait(&ctx);  // wait all completions + fsync
- *   uring_flush_destroy(&ctx);
+ * On macOS / older Linux: transparent fallback to pwrite/pread loops.
  */
 
 #ifndef GRAVELDB_IO_URING_FLUSH_H_
@@ -29,11 +21,6 @@
 extern "C" {
 #endif
 
-/*
- * Detect io_uring availability at compile time.
- * Define GRAVELDB_USE_IO_URING=1 to force enable (for cross-compile).
- * It auto-enables on Linux by default.
- */
 #if !defined(GRAVELDB_USE_IO_URING)
   #if defined(__linux__)
     #define GRAVELDB_USE_IO_URING 1
@@ -42,52 +29,72 @@ extern "C" {
   #endif
 #endif
 
-/* Maximum in-flight I/O requests per flush batch */
-#define URING_FLUSH_QUEUE_DEPTH  256
+/* Maximum in-flight I/O requests per batch */
+#define URING_QUEUE_DEPTH  1024
+
+/* Maximum distinct fds that can receive fsync in one batch */
+#define URING_MAX_FDS      64
+
+/*
+ * I/O context: supports batch writes and batch reads.
+ * One ring shared across multiple file descriptors.
+ */
 
 typedef struct {
-    int         fd;
-    uint32_t    pending;       /* number of submitted but not yet completed */
-    uint32_t    errors;        /* count of failed completions */
+    uint32_t    pending;
+    uint32_t    errors;
     bool        initialized;
 
+    /* Track distinct fds that received writes (for per-fd fsync) */
+    int         fsync_fds[URING_MAX_FDS];
+    int         fsync_fd_count;
+
 #if GRAVELDB_USE_IO_URING
-    void       *ring;          /* struct io_uring* (opaque to avoid header leak) */
+    void       *ring;   /* struct io_uring* (opaque) */
 #endif
-} uring_flush_ctx_t;
+} uring_io_ctx_t;
 
 /*
- * Initialize the flush context for the given file descriptor.
- * Returns 0 on success, -1 on failure (caller should fallback to pwrite).
+ * Initialize the I/O context (not bound to any single fd).
+ * Returns 0 on success, -1 on failure.
  */
-int uring_flush_init(uring_flush_ctx_t *ctx, int fd);
+int uring_io_init(uring_io_ctx_t *ctx);
 
 /*
- * Submit a write request. The data must remain valid until uring_flush_wait().
- * Returns 0 on success, -1 if the ring is full (caller should wait first).
+ * Submit a write request for a specific fd.
+ * Data must remain valid until uring_io_wait().
  */
-int uring_flush_submit(uring_flush_ctx_t *ctx, const void *buf, size_t len, off_t offset);
+int uring_io_submit_write(uring_io_ctx_t *ctx, int fd,
+                          const void *buf, size_t len, off_t offset);
 
 /*
- * Submit an fsync/fdatasync request (appended after all writes).
- * Returns 0 on success.
+ * Submit a read request for a specific fd.
+ * Buffer must remain valid until uring_io_wait().
  */
-int uring_flush_submit_fsync(uring_flush_ctx_t *ctx);
+int uring_io_submit_read(uring_io_ctx_t *ctx, int fd,
+                         void *buf, size_t len, off_t offset);
 
 /*
- * Wait for all submitted I/O to complete. Returns number of errors (0 = all OK).
+ * Submit fsync for all fds that received writes.
+ * Called after all writes are submitted, before wait.
  */
-int uring_flush_wait(uring_flush_ctx_t *ctx);
+int uring_io_submit_fsyncs(uring_io_ctx_t *ctx);
 
 /*
- * Destroy the flush context and free kernel resources.
+ * Wait for all submitted I/O (reads + writes + fsyncs) to complete.
+ * Returns number of errors (0 = all OK).
  */
-void uring_flush_destroy(uring_flush_ctx_t *ctx);
+int uring_io_wait(uring_io_ctx_t *ctx);
 
 /*
- * Check if io_uring is available at runtime (may fail on old kernels even on Linux).
+ * Destroy the I/O context.
  */
-bool uring_flush_available(void);
+void uring_io_destroy(uring_io_ctx_t *ctx);
+
+/*
+ * Check if io_uring is available at runtime.
+ */
+bool uring_io_available(void);
 
 #ifdef __cplusplus
 }

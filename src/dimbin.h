@@ -35,6 +35,38 @@ typedef struct {
 } PageSlot;
 
 /*
+ * Lookup a page_id in open-addressing hashmap.
+ * Returns slot index if found, or the first empty slot index (for insertion).
+ */
+static inline uint32_t pagemap_find(const PageSlot *slots, uint32_t capacity,
+                                     uint32_t page_id) {
+    uint32_t mask = capacity - 1;
+    uint32_t idx = (page_id * 2654435761u) & mask;
+    while (slots[idx].page_id != PAGE_SLOT_EMPTY && slots[idx].page_id != page_id) {
+        idx = (idx + 1) & mask;
+    }
+    return idx;
+}
+
+/*
+ * Remove a slot (backward-shift deletion).
+ */
+static inline void pagemap_remove(PageSlot *slots, uint32_t capacity, uint32_t rm_idx) {
+    uint32_t mask = capacity - 1;
+    slots[rm_idx].page_id = PAGE_SLOT_EMPTY;
+    slots[rm_idx].data = NULL;
+    uint32_t idx = (rm_idx + 1) & mask;
+    while (slots[idx].page_id != PAGE_SLOT_EMPTY) {
+        PageSlot tmp = slots[idx];
+        slots[idx].page_id = PAGE_SLOT_EMPTY;
+        slots[idx].data = NULL;
+        uint32_t new_idx = pagemap_find(slots, capacity, tmp.page_id);
+        slots[new_idx] = tmp;
+        idx = (idx + 1) & mask;
+    }
+}
+
+/*
  * WriteBuffer: open-addressing hashmap of dirty pages.
  * Memory proportional to actual dirty page count, not max page_id.
  * Flushes when count reaches max_pages.
@@ -95,6 +127,21 @@ uint32_t dimbin_alloc_entry(DimBin *s);
 void dimbin_free_entry(DimBin *s, uint32_t entry_idx);
 graveldb_status_t dimbin_get(DimBin *s, uint32_t entry_id, float *buf);
 graveldb_status_t dimbin_put(DimBin *s, uint32_t entry_id, const float *data);
+
+/*
+ * Batch embedding write with page-level coalescing.
+ * Accepts array of (entry_id, data_ptr) pairs. Groups them by page,
+ * loads each unique page once, patches all entries in-memory, defers
+ * water-level flush to the end. Dramatically reduces ensure_page lookups
+ * and avoids mid-batch flush interruptions.
+ */
+typedef struct {
+    uint32_t     entry_id;
+    const float *data;
+} EmbWriteEntry;
+
+graveldb_status_t dimbin_put_batch(DimBin *s, const EmbWriteEntry *entries, int count);
+
 graveldb_status_t dimbin_put_key(DimBin *s, uint32_t entry_idx, uint64_t feat_id);
 
 /*

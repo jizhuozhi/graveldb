@@ -1,18 +1,12 @@
 /*
- * GravelDB - io_uring batch flush implementation
+ * GravelDB - io_uring batch I/O implementation (multi-fd)
  *
- * Strategy:
- *   1. All block writes are submitted to the SQ ring without syscalls
- *   2. A final FSYNC SQE is chained (IOSQE_IO_DRAIN ensures ordering)
- *   3. One io_uring_enter() submits everything + waits for all CQEs
+ * Single ring shared across all DimBin fds:
+ *   - Writes + reads submitted to arbitrary fds
+ *   - Per-fd fsync after all writes
+ *   - One io_uring_enter() for everything
  *
- * This turns a flush of N blocks from:
- *   N * pwrite() + 1 * fdatasync() = (N+1) syscalls
- * Into:
- *   1 * io_uring_enter() = 1 syscall (or 0 with SQPOLL)
- *
- * Fallback: on macOS or kernels without io_uring, all functions degrade
- * gracefully to pwrite + fdatasync.
+ * On macOS / older Linux: transparent fallback to pwrite/pread loops.
  */
 
 #include "io_uring_flush.h"
@@ -25,53 +19,50 @@
 
 #include <liburing.h>
 
-int uring_flush_init(uring_flush_ctx_t *ctx, int fd) {
+int uring_io_init(uring_io_ctx_t *ctx) {
     memset(ctx, 0, sizeof(*ctx));
-    ctx->fd = fd;
 
     struct io_uring *ring = (struct io_uring *)malloc(sizeof(struct io_uring));
     if (!ring) return -1;
 
-    /*
-     * Queue depth = URING_FLUSH_QUEUE_DEPTH.
-     * IORING_SETUP_SINGLE_ISSUER: hint that only one thread submits (our case).
-     * We don't use SQPOLL to avoid needing CAP_SYS_ADMIN / elevated privs.
-     */
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
 
-    int ret = io_uring_queue_init_params(URING_FLUSH_QUEUE_DEPTH, ring, &params);
+    int ret = io_uring_queue_init_params(URING_QUEUE_DEPTH, ring, &params);
     if (ret < 0) {
-        /* io_uring not supported on this kernel */
         free(ring);
         return -1;
     }
 
     ctx->ring = ring;
     ctx->initialized = true;
+    ctx->fsync_fd_count = 0;
     return 0;
 }
 
-int uring_flush_submit(uring_flush_ctx_t *ctx, const void *buf, size_t len, off_t offset) {
-    if (!ctx->initialized) return -1;
+/* Track fd for later fsync (dedup) */
+static void uring_io_track_fd(uring_io_ctx_t *ctx, int fd) {
+    for (int i = 0; i < ctx->fsync_fd_count; i++) {
+        if (ctx->fsync_fds[i] == fd) return;
+    }
+    if (ctx->fsync_fd_count < URING_MAX_FDS) {
+        ctx->fsync_fds[ctx->fsync_fd_count++] = fd;
+    }
+}
 
+static struct io_uring_sqe *uring_io_get_sqe(uring_io_ctx_t *ctx) {
     struct io_uring *ring = (struct io_uring *)ctx->ring;
     struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
 
     if (!sqe) {
-        /*
-         * SQ ring full -- need to submit current batch and wait,
-         * then retry. For simplicity, submit what we have first.
-         */
+        /* SQ full: submit + drain some completions */
         int ret = io_uring_submit(ring);
-        if (ret < 0) return -1;
+        if (ret < 0) return NULL;
 
-        /* Wait for some completions to free SQ slots */
         struct io_uring_cqe *cqe;
         ret = io_uring_wait_cqe(ring, &cqe);
-        if (ret < 0) return -1;
+        if (ret < 0) return NULL;
 
-        /* Consume completed entries */
         unsigned head;
         unsigned count = 0;
         io_uring_for_each_cqe(ring, head, cqe) {
@@ -81,51 +72,68 @@ int uring_flush_submit(uring_flush_ctx_t *ctx, const void *buf, size_t len, off_
         }
         io_uring_cq_advance(ring, count);
 
-        /* Retry getting SQE */
         sqe = io_uring_get_sqe(ring);
-        if (!sqe) return -1;
     }
+    return sqe;
+}
 
-    io_uring_prep_write(sqe, ctx->fd, buf, (unsigned)len, offset);
-    io_uring_sqe_set_data(sqe, NULL);  /* no user data needed */
+int uring_io_submit_write(uring_io_ctx_t *ctx, int fd,
+                          const void *buf, size_t len, off_t offset) {
+    if (!ctx->initialized) return -1;
+
+    struct io_uring_sqe *sqe = uring_io_get_sqe(ctx);
+    if (!sqe) return -1;
+
+    io_uring_prep_write(sqe, fd, buf, (unsigned)len, offset);
+    io_uring_sqe_set_data(sqe, NULL);
     ctx->pending++;
 
+    uring_io_track_fd(ctx, fd);
     return 0;
 }
 
-int uring_flush_submit_fsync(uring_flush_ctx_t *ctx) {
+int uring_io_submit_read(uring_io_ctx_t *ctx, int fd,
+                         void *buf, size_t len, off_t offset) {
+    if (!ctx->initialized) return -1;
+
+    struct io_uring_sqe *sqe = uring_io_get_sqe(ctx);
+    if (!sqe) return -1;
+
+    io_uring_prep_read(sqe, fd, buf, (unsigned)len, offset);
+    io_uring_sqe_set_data(sqe, NULL);
+    ctx->pending++;
+    return 0;
+}
+
+int uring_io_submit_fsyncs(uring_io_ctx_t *ctx) {
     if (!ctx->initialized) return -1;
 
     struct io_uring *ring = (struct io_uring *)ctx->ring;
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-    if (!sqe) return -1;
 
-    /*
-     * IORING_FSYNC_DATASYNC = fdatasync semantics (metadata not synced
-     * unless needed for data integrity). IO_DRAIN ensures all prior
-     * writes complete before the fsync executes.
-     */
-    io_uring_prep_fsync(sqe, ctx->fd, IORING_FSYNC_DATASYNC);
-    sqe->flags |= IOSQE_IO_DRAIN;
-    io_uring_sqe_set_data(sqe, (void *)(uintptr_t)1);  /* tag: fsync */
-    ctx->pending++;
+    for (int i = 0; i < ctx->fsync_fd_count; i++) {
+        struct io_uring_sqe *sqe = uring_io_get_sqe(ctx);
+        if (!sqe) return -1;
+
+        io_uring_prep_fsync(sqe, ctx->fsync_fds[i], IORING_FSYNC_DATASYNC);
+        sqe->flags |= IOSQE_IO_DRAIN;
+        io_uring_sqe_set_data(sqe, (void *)(uintptr_t)1);
+        ctx->pending++;
+    }
 
     return 0;
 }
 
-int uring_flush_wait(uring_flush_ctx_t *ctx) {
+int uring_io_wait(uring_io_ctx_t *ctx) {
     if (!ctx->initialized || ctx->pending == 0) return ctx->errors;
 
     struct io_uring *ring = (struct io_uring *)ctx->ring;
 
-    /* Submit all queued SQEs */
     int ret = io_uring_submit(ring);
     if (ret < 0) {
         ctx->errors++;
         return ctx->errors;
     }
 
-    /* Wait for all completions */
     while (ctx->pending > 0) {
         struct io_uring_cqe *cqe;
         ret = io_uring_wait_cqe(ring, &cqe);
@@ -134,13 +142,10 @@ int uring_flush_wait(uring_flush_ctx_t *ctx) {
             break;
         }
 
-        /* Drain all available CQEs */
         unsigned head;
         unsigned count = 0;
         io_uring_for_each_cqe(ring, head, cqe) {
-            if (cqe->res < 0) {
-                ctx->errors++;
-            }
+            if (cqe->res < 0) ctx->errors++;
             count++;
         }
         io_uring_cq_advance(ring, count);
@@ -151,9 +156,8 @@ int uring_flush_wait(uring_flush_ctx_t *ctx) {
     return ctx->errors;
 }
 
-void uring_flush_destroy(uring_flush_ctx_t *ctx) {
+void uring_io_destroy(uring_io_ctx_t *ctx) {
     if (!ctx->initialized) return;
-
     struct io_uring *ring = (struct io_uring *)ctx->ring;
     io_uring_queue_exit(ring);
     free(ring);
@@ -161,8 +165,7 @@ void uring_flush_destroy(uring_flush_ctx_t *ctx) {
     ctx->initialized = false;
 }
 
-bool uring_flush_available(void) {
-    /* Probe: try to init a minimal ring */
+bool uring_io_available(void) {
     struct io_uring ring;
     int ret = io_uring_queue_init(1, &ring, 0);
     if (ret < 0) return false;
@@ -172,26 +175,42 @@ bool uring_flush_available(void) {
 
 #else /* !GRAVELDB_USE_IO_URING -- fallback for macOS / non-Linux */
 
-/*
- * Fallback implementation: pwrite each block immediately on submit,
- * fdatasync on wait. Same API so dimbin_flush needs zero #ifdefs.
- *
- * On macOS there's no io_uring equivalent (kqueue doesn't do async disk I/O
- * for regular files). pwrite is the best we can do.
- */
-
-int uring_flush_init(uring_flush_ctx_t *ctx, int fd) {
+int uring_io_init(uring_io_ctx_t *ctx) {
     memset(ctx, 0, sizeof(*ctx));
-    ctx->fd = fd;
     ctx->initialized = true;
+    ctx->fsync_fd_count = 0;
     return 0;
 }
 
-int uring_flush_submit(uring_flush_ctx_t *ctx, const void *buf, size_t len, off_t offset) {
+static void uring_io_track_fd_fallback(uring_io_ctx_t *ctx, int fd) {
+    for (int i = 0; i < ctx->fsync_fd_count; i++) {
+        if (ctx->fsync_fds[i] == fd) return;
+    }
+    if (ctx->fsync_fd_count < URING_MAX_FDS) {
+        ctx->fsync_fds[ctx->fsync_fd_count++] = fd;
+    }
+}
+
+int uring_io_submit_write(uring_io_ctx_t *ctx, int fd,
+                          const void *buf, size_t len, off_t offset) {
     if (!ctx->initialized) return -1;
 
-    ssize_t wr = pwrite(ctx->fd, buf, len, offset);
+    ssize_t wr = pwrite(fd, buf, len, offset);
     if (wr < 0 || (size_t)wr != len) {
+        ctx->errors++;
+        return -1;
+    }
+    ctx->pending++;
+    uring_io_track_fd_fallback(ctx, fd);
+    return 0;
+}
+
+int uring_io_submit_read(uring_io_ctx_t *ctx, int fd,
+                         void *buf, size_t len, off_t offset) {
+    if (!ctx->initialized) return -1;
+
+    ssize_t rd = pread(fd, buf, len, offset);
+    if (rd < 0) {
         ctx->errors++;
         return -1;
     }
@@ -199,27 +218,28 @@ int uring_flush_submit(uring_flush_ctx_t *ctx, const void *buf, size_t len, off_
     return 0;
 }
 
-int uring_flush_submit_fsync(uring_flush_ctx_t *ctx) {
-    (void)ctx;
-    return 0;  /* fdatasync happens in wait() */
+int uring_io_submit_fsyncs(uring_io_ctx_t *ctx) {
+    if (!ctx->initialized) return -1;
+
+    for (int i = 0; i < ctx->fsync_fd_count; i++) {
+        fdatasync(ctx->fsync_fds[i]);
+    }
+    return 0;
 }
 
-int uring_flush_wait(uring_flush_ctx_t *ctx) {
+int uring_io_wait(uring_io_ctx_t *ctx) {
     if (!ctx->initialized) return (int)ctx->errors;
-
-    if (ctx->pending > 0) {
-        fdatasync(ctx->fd);
-    }
+    /* In fallback mode, all I/O is already done synchronously */
     ctx->pending = 0;
     return (int)ctx->errors;
 }
 
-void uring_flush_destroy(uring_flush_ctx_t *ctx) {
+void uring_io_destroy(uring_io_ctx_t *ctx) {
     if (!ctx->initialized) return;
     ctx->initialized = false;
 }
 
-bool uring_flush_available(void) {
+bool uring_io_available(void) {
     return false;
 }
 

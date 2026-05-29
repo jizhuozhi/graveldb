@@ -18,6 +18,16 @@
 #endif
 
 #include "dimbin.h"
+#include "io_uring_flush.h"
+
+/* Peephole gap for flush merge (same value as dimbin.c) */
+#define PEEPHOLE_GAP_MAX  4
+
+static int cmp_u32(const void *a, const void *b) {
+    uint32_t va = *(const uint32_t *)a;
+    uint32_t vb = *(const uint32_t *)b;
+    return (va > vb) - (va < vb);
+}
 
 void ensure_dir(const char *path) {
     struct stat st;
@@ -391,17 +401,41 @@ graveldb_status_t graveldb_delete(GravelDB *db, GravelDBCtx *ctx, uint64_t feat_
 }
 
 /*
- * Batch Get
+ * Batch Get -- io_uring parallel reads with same-page coalescing.
  *
- * Hash table provides O(1) random access per key, so batch lookups are
- * simply individual lookups in a tight loop. The hash table's open addressing
- * with linear probing gives excellent cache behavior for sequential probes.
+ * Strategy:
+ *   1. Resolve all feat_ids through hash index → (dim_idx, entry_idx)
+ *   2. For each entry: check write buffer / overlay (memory hit → memcpy)
+ *   3. Collect disk misses, group by (fd, page_id) for coalescing
+ *   4. For each unique page needed: submit one page-sized io_uring read
+ *   5. Wait all reads, then scatter data from page buffers to output buffers
+ *
+ * This turns N random pread syscalls into ~M page reads (M << N when entries
+ * cluster on pages) submitted as one io_uring batch.
  */
 
 graveldb_status_t graveldb_batch_get(GravelDB *db, GravelDBCtx *ctx,
                                      const uint64_t *feat_ids, int n,
                                      float **out_embeddings, int *out_dims) {
     (void)ctx;
+    if (n <= 0) return GRAVELDB_OK;
+
+    /* Phase 1: resolve + memory hits */
+    typedef struct {
+        int       req_idx;      /* original request index */
+        DimBin   *bin;
+        uint32_t  entry_id;
+        uint32_t  page_id;
+        uint32_t  offset_in_page;
+    } DiskRead;
+
+    /* Stack alloc for small batches, heap for large */
+    DiskRead stack_reads[64];
+    DiskRead *disk_reads = (n <= 64) ? stack_reads :
+                           (DiskRead *)malloc((size_t)n * sizeof(DiskRead));
+    if (!disk_reads) return GRAVELDB_ERR_OOM;
+    int disk_count = 0;
+
     for (int i = 0; i < n; i++) {
         uint16_t dim_idx;
         uint32_t entry_idx;
@@ -413,12 +447,157 @@ graveldb_status_t graveldb_batch_get(GravelDB *db, GravelDBCtx *ctx,
 
         DimBin *bin = dim_registry_get_bin(&db->dim_reg, dim_idx);
         if (out_dims) out_dims[i] = bin->dim;
+        if (!out_embeddings[i]) continue;
 
-        if (out_embeddings[i]) {
-            dimbin_get(bin, entry_idx, out_embeddings[i]);
+        /* Check overlay (checkpoint in progress) */
+        if (bin->in_checkpoint && overlay_contains(&bin->overlay, entry_idx)) {
+            overlay_get(&bin->overlay, entry_idx, out_embeddings[i], bin->dim);
+            continue;
+        }
+
+        uint32_t page_id = entry_idx / bin->entries_per_page;
+        uint32_t offset_in_page = (entry_idx % bin->entries_per_page) * bin->entry_size;
+
+        /* Check write buffer (read-your-writes) */
+        WriteBuffer *wb = &bin->write_buf;
+        uint32_t wb_idx = pagemap_find(wb->slots, wb->capacity, page_id);
+        if (wb->slots[wb_idx].page_id == page_id) {
+            memcpy(out_embeddings[i], wb->slots[wb_idx].data + offset_in_page, bin->entry_size);
+            continue;
+        }
+
+        /* Disk miss: collect for batch I/O */
+        disk_reads[disk_count].req_idx = i;
+        disk_reads[disk_count].bin = bin;
+        disk_reads[disk_count].entry_id = entry_idx;
+        disk_reads[disk_count].page_id = page_id;
+        disk_reads[disk_count].offset_in_page = offset_in_page;
+        disk_count++;
+    }
+
+    if (disk_count == 0) {
+        if (disk_reads != stack_reads) free(disk_reads);
+        return GRAVELDB_OK;
+    }
+
+    /* Phase 2: Sort disk reads by (fd, page_id) for coalescing */
+    /* Simple sort by (bin pointer, page_id) -- entries in same bin+page become adjacent */
+    for (int i = 1; i < disk_count; i++) {
+        DiskRead key = disk_reads[i];
+        int j = i - 1;
+        while (j >= 0 && (disk_reads[j].bin > key.bin ||
+               (disk_reads[j].bin == key.bin && disk_reads[j].page_id > key.page_id))) {
+            disk_reads[j + 1] = disk_reads[j];
+            j--;
+        }
+        disk_reads[j + 1] = key;
+    }
+
+    /* Phase 3: Deduplicate pages + submit io_uring reads */
+    typedef struct {
+        DimBin   *bin;
+        uint32_t  page_id;
+        uint8_t  *buf;          /* page buffer */
+        int       first_idx;    /* index into disk_reads for scatter */
+        int       count;        /* how many entries use this page */
+    } PageRead;
+
+    PageRead stack_pages[64];
+    int max_pages = disk_count;  /* upper bound: one page per read */
+    PageRead *page_reads = (max_pages <= 64) ? stack_pages :
+                           (PageRead *)malloc((size_t)max_pages * sizeof(PageRead));
+    if (!page_reads) {
+        if (disk_reads != stack_reads) free(disk_reads);
+        return GRAVELDB_ERR_OOM;
+    }
+    int page_count = 0;
+
+    /* Identify unique pages */
+    int i = 0;
+    while (i < disk_count) {
+        DimBin *bin = disk_reads[i].bin;
+        uint32_t pg = disk_reads[i].page_id;
+        int j = i + 1;
+        while (j < disk_count && disk_reads[j].bin == bin && disk_reads[j].page_id == pg) {
+            j++;
+        }
+        page_reads[page_count].bin = bin;
+        page_reads[page_count].page_id = pg;
+        page_reads[page_count].first_idx = i;
+        page_reads[page_count].count = j - i;
+        page_reads[page_count].buf = NULL;
+        page_count++;
+        i = j;
+    }
+
+    /* Allocate page buffers + submit reads */
+    uring_io_ctx_t io_ctx;
+    int use_uring = (uring_io_init(&io_ctx) == 0);
+    graveldb_status_t rc = GRAVELDB_OK;
+
+    for (int p = 0; p < page_count; p++) {
+        DimBin *bin = page_reads[p].bin;
+        uint32_t pg = page_reads[p].page_id;
+
+        /* For single-entry pages where entry_size == page_size, read directly into output */
+        if (page_reads[p].count == 1 && bin->entries_per_page == 1) {
+            int ri = page_reads[p].first_idx;
+            page_reads[p].buf = (uint8_t *)out_embeddings[disk_reads[ri].req_idx];
+            if (use_uring) {
+                uring_io_submit_read(&io_ctx, bin->fd, page_reads[p].buf,
+                                     bin->entry_size, (off_t)disk_reads[ri].entry_id * bin->entry_size);
+            } else {
+                ssize_t rd = pread(bin->fd, page_reads[p].buf, bin->entry_size,
+                                   (off_t)disk_reads[ri].entry_id * bin->entry_size);
+                if (rd < 0) rc = GRAVELDB_ERR_IO;
+            }
+            continue;
+        }
+
+        /* Allocate temp page buffer */
+        uint8_t *pbuf = (uint8_t *)malloc(bin->page_size);
+        if (!pbuf) { rc = GRAVELDB_ERR_OOM; continue; }
+        page_reads[p].buf = pbuf;
+
+        if (use_uring) {
+            uring_io_submit_read(&io_ctx, bin->fd, pbuf,
+                                 bin->page_size, (off_t)pg * bin->page_size);
+        } else {
+            ssize_t rd = pread(bin->fd, pbuf, bin->page_size, (off_t)pg * bin->page_size);
+            if (rd < 0) rc = GRAVELDB_ERR_IO;
         }
     }
-    return GRAVELDB_OK;
+
+    /* Wait for all reads */
+    if (use_uring) {
+        int errors = uring_io_wait(&io_ctx);
+        if (errors > 0) rc = GRAVELDB_ERR_IO;
+        uring_io_destroy(&io_ctx);
+    } else {
+        uring_io_destroy(&io_ctx);
+    }
+
+    /* Phase 4: Scatter data from page buffers to output */
+    for (int p = 0; p < page_count; p++) {
+        if (!page_reads[p].buf) continue;
+        DimBin *bin = page_reads[p].bin;
+
+        /* Single-entry direct-to-output case: already done */
+        if (page_reads[p].count == 1 && bin->entries_per_page == 1) continue;
+
+        for (int k = 0; k < page_reads[p].count; k++) {
+            int ri = page_reads[p].first_idx + k;
+            int req_idx = disk_reads[ri].req_idx;
+            uint32_t off = disk_reads[ri].offset_in_page;
+            memcpy(out_embeddings[req_idx], page_reads[p].buf + off, bin->entry_size);
+        }
+
+        free(page_reads[p].buf);
+    }
+
+    if (page_reads != stack_pages) free(page_reads);
+    if (disk_reads != stack_reads) free(disk_reads);
+    return rc;
 }
 
 /*
@@ -591,12 +770,29 @@ graveldb_status_t graveldb_batch_put(GravelDB *db, GravelDBCtx *ctx,
             ctx_dealloc(ctx, key_batch, key_batch_size);
         }
 
-        /* Phase 2b: Now write embeddings (memory buffer -- safe after key persist) */
-        if (deferred) {
-            for (int d = 0; d < deferred_count; d++) {
-                graveldb_status_t wrc = dimbin_put(bin, deferred[d].entry_id,
-                                                   embeddings[deferred[d].orig_idx]);
+        /* Phase 2b: Batch write embeddings with page-level coalescing.
+         * All entries for this dim group are submitted as one batch to
+         * dimbin_put_batch, which sorts by page, coalesces same-page writes,
+         * and defers flush to end -- maximizing I/O merge on flush. */
+        if (deferred && deferred_count > 0) {
+            /* Build EmbWriteEntry array from deferred list */
+            size_t emb_batch_size = (size_t)deferred_count * sizeof(EmbWriteEntry);
+            EmbWriteEntry *emb_batch = (EmbWriteEntry *)ctx_alloc(ctx, emb_batch_size);
+            if (emb_batch) {
+                for (int d = 0; d < deferred_count; d++) {
+                    emb_batch[d].entry_id = deferred[d].entry_id;
+                    emb_batch[d].data = embeddings[deferred[d].orig_idx];
+                }
+                graveldb_status_t wrc = dimbin_put_batch(bin, emb_batch, deferred_count);
                 if (wrc != GRAVELDB_OK) { rc = wrc; }
+                ctx_dealloc(ctx, emb_batch, emb_batch_size);
+            } else {
+                /* Fallback: individual puts if batch alloc fails */
+                for (int d = 0; d < deferred_count; d++) {
+                    graveldb_status_t wrc = dimbin_put(bin, deferred[d].entry_id,
+                                                       embeddings[deferred[d].orig_idx]);
+                    if (wrc != GRAVELDB_OK) { rc = wrc; }
+                }
             }
             ctx_dealloc(ctx, deferred, deferred_size);
         }
@@ -608,14 +804,101 @@ graveldb_status_t graveldb_batch_put(GravelDB *db, GravelDBCtx *ctx,
     return rc;
 }
 
+/*
+ * Cross-DimBin parallel flush: collect all dirty pages from all bins into
+ * a single io_uring ring, submit writes across all fds, per-fd fsync, one wait.
+ * Maximizes NVMe queue depth utilization across multiple data files.
+ */
 graveldb_status_t graveldb_flush(GravelDB *db) {
     uint16_t num_slabs = dim_registry_count(&db->dim_reg);
+    if (num_slabs == 0) return GRAVELDB_OK;
+
+    uring_io_ctx_t io_ctx;
+    int use_uring = (uring_io_init(&io_ctx) == 0);
+    graveldb_status_t rc = GRAVELDB_OK;
+
     for (uint16_t i = 0; i < num_slabs; i++) {
         DimBin *s = dim_registry_get_bin(&db->dim_reg, i);
-        graveldb_status_t rc = dimbin_flush(s);
-        if (rc != GRAVELDB_OK) return rc;
+        WriteBuffer *wb = &s->write_buf;
+        if (wb->count == 0) continue;
+
+        /* Collect page_ids from this bin's hashmap */
+        uint32_t *dirty_pages = s->flush_dirty_buf;
+        int n = 0;
+        for (uint32_t j = 0; j < wb->capacity && n < GRAVELDB_MAX_FLUSH_BATCH; j++) {
+            if (wb->slots[j].page_id != PAGE_SLOT_EMPTY) {
+                dirty_pages[n++] = wb->slots[j].page_id;
+            }
+        }
+        if (n == 0) continue;
+
+        /* Sort for peephole merge */
+        qsort(dirty_pages, n, sizeof(uint32_t), cmp_u32);
+
+        /* Submit writes for this bin into shared ring */
+        int pi = 0;
+        while (pi < n) {
+            int pj = pi + 1;
+            while (pj < n && dirty_pages[pj] <= dirty_pages[pj - 1] + PEEPHOLE_GAP_MAX + 1) {
+                pj++;
+            }
+            for (int k = pi; k < pj; k++) {
+                uint32_t pg = dirty_pages[k];
+                uint32_t slot_idx = pagemap_find(wb->slots, wb->capacity, pg);
+                if (wb->slots[slot_idx].page_id != pg) continue;
+
+                if (use_uring) {
+                    if (uring_io_submit_write(&io_ctx, s->fd,
+                                             wb->slots[slot_idx].data,
+                                             s->page_size,
+                                             (off_t)pg * s->page_size) < 0) {
+                        rc = GRAVELDB_ERR_IO;
+                    }
+                } else {
+                    ssize_t wr = pwrite(s->fd, wb->slots[slot_idx].data,
+                                        s->page_size, (off_t)pg * s->page_size);
+                    if (wr != (ssize_t)s->page_size) rc = GRAVELDB_ERR_IO;
+                }
+            }
+            wb->flush_bytes += (size_t)(pj - pi) * s->page_size;
+            pi = pj;
+        }
     }
-    return GRAVELDB_OK;
+
+    /* Submit per-fd fsyncs + wait for all I/O across all bins */
+    if (use_uring) {
+        uring_io_submit_fsyncs(&io_ctx);
+        int errors = uring_io_wait(&io_ctx);
+        if (errors > 0) rc = GRAVELDB_ERR_IO;
+        uring_io_destroy(&io_ctx);
+    } else {
+        uring_io_destroy(&io_ctx);
+    }
+
+    /* Free pages from all bins AFTER I/O confirmed complete */
+    for (uint16_t i = 0; i < num_slabs; i++) {
+        DimBin *s = dim_registry_get_bin(&db->dim_reg, i);
+        WriteBuffer *wb = &s->write_buf;
+        if (wb->count == 0) continue;
+
+        uint32_t *dirty_pages = s->flush_dirty_buf;
+        int n = 0;
+        for (uint32_t j = 0; j < wb->capacity && n < GRAVELDB_MAX_FLUSH_BATCH; j++) {
+            if (wb->slots[j].page_id != PAGE_SLOT_EMPTY) {
+                dirty_pages[n++] = wb->slots[j].page_id;
+            }
+        }
+        for (int k = 0; k < n; k++) {
+            uint32_t pg = dirty_pages[k];
+            uint32_t slot_idx = pagemap_find(wb->slots, wb->capacity, pg);
+            if (wb->slots[slot_idx].page_id != pg) continue;
+            slab_free_aligned(s->allocator, wb->slots[slot_idx].data, s->page_size);
+            pagemap_remove(wb->slots, wb->capacity, slot_idx);
+            wb->count--;
+        }
+    }
+
+    return rc;
 }
 
 graveldb_status_t graveldb_checkpoint(GravelDB *db) {
