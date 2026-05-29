@@ -147,18 +147,49 @@ typedef struct {
     ReqArena  arena;      /* per-request scratch allocator */
 } ClientConn;
 
+/* ===== Read Worker (readonly mode multi-threaded reads) =====
+ *
+ * Each ReadWorker is an independent event loop thread that handles
+ * only pull/ping/stats requests. Because the DB is never mutated in
+ * readonly mode, all reads are lock-free — no synchronization needed.
+ *
+ * The main accept loop distributes new connections to workers via a
+ * pipe (round-robin). Each worker has its own poller + client array.
+ */
+#define WORKER_MAX_CLIENTS  64
+#define NOTIFY_SENTINEL     ((void *)(uintptr_t)0xDEAD0002)
+
+typedef struct {
+    GravelDB       *db;            /* shared, read-only reference */
+    IOPoller       *poller;
+    ClientConn      clients[WORKER_MAX_CLIENTS];
+    int             num_clients;
+    int             notify_fd;     /* read end of pipe for new fd delivery */
+    volatile int   *running;       /* pointer to srv->running */
+    bool            readonly;
+    pthread_t       thread;
+    int             worker_id;
+} ReadWorker;
+
 struct GravelServer {
     GravelServerConfig config;
     GravelDB      *db;
     CkptScheduler  ckpt_sched;
     int            listen_fd;
     volatile int   running;
+    bool           readonly;
 
     ClientConn     clients[MAX_CLIENTS];
     int            num_clients;
 
     IOPoller      *poller;
     pthread_t      server_thread;
+
+    /* Readonly mode: worker threads for lock-free concurrent reads */
+    int            num_read_workers;
+    ReadWorker    *workers;
+    int           *worker_pipe_w;    /* write ends of pipes (one per worker) */
+    int            rr_next;          /* round-robin counter for accept distribution */
 };
 
 static uint64_t now_ms(void) {
@@ -449,10 +480,20 @@ static int process_message(GravelServer *srv, ClientConn *c) {
 
     switch ((graveldb_msg_type_t)msg_type) {
         case GRAVELDB_MSG_PULL:       handle_pull(srv, c, body, body_len); break;
-        case GRAVELDB_MSG_PUSH:       handle_push(srv, c, body, body_len); break;
-        case GRAVELDB_MSG_DELETE:     handle_delete(srv, c, body, body_len); break;
-        case GRAVELDB_MSG_FLUSH:     handle_flush(srv, c); break;
-        case GRAVELDB_MSG_CHECKPOINT: handle_checkpoint(srv, c); break;
+        case GRAVELDB_MSG_PUSH:
+        case GRAVELDB_MSG_DELETE:
+        case GRAVELDB_MSG_FLUSH:
+        case GRAVELDB_MSG_CHECKPOINT:
+            if (srv->readonly) {
+                response_begin(c, GRAVELDB_WIRE_INVALID);
+                response_finish(c);
+                break;
+            }
+            if (msg_type == GRAVELDB_MSG_PUSH)       handle_push(srv, c, body, body_len);
+            else if (msg_type == GRAVELDB_MSG_DELETE) handle_delete(srv, c, body, body_len);
+            else if (msg_type == GRAVELDB_MSG_FLUSH)  handle_flush(srv, c);
+            else                                      handle_checkpoint(srv, c);
+            break;
         case GRAVELDB_MSG_STATS:     handle_stats(srv, c); break;
         case GRAVELDB_MSG_PING:      handle_ping(srv, c); break;
         default:
@@ -483,7 +524,9 @@ static void *server_loop(void *arg) {
     while (srv->running) {
         int n = io_poller_wait(srv->poller, events, MAX_CLIENTS + 1, 100);
 
-        ckpt_scheduler_tick(&srv->ckpt_sched, now_ms());
+        if (!srv->readonly) {
+            ckpt_scheduler_tick(&srv->ckpt_sched, now_ms());
+        }
 
         if (n <= 0) continue;
 
@@ -587,6 +630,172 @@ static void *server_loop(void *arg) {
     return NULL;
 }
 
+/* ===== ReadWorker event loop (readonly mode) =====
+ *
+ * Each worker is fully independent: its own poller, its own clients.
+ * It receives new fds via the notify pipe and handles only reads.
+ * No locks, no shared mutable state — the DB is frozen.
+ */
+static ClientConn *worker_find_free_slot(ReadWorker *w) {
+    for (int i = 0; i < WORKER_MAX_CLIENTS; i++) {
+        if (w->clients[i].fd == -1) return &w->clients[i];
+    }
+    return NULL;
+}
+
+static void *read_worker_loop(void *arg) {
+    ReadWorker *w = (ReadWorker *)arg;
+    IOEvent events[WORKER_MAX_CLIENTS + 1];
+
+    /* Fake GravelServer for process_message (only db and readonly fields used).
+     * Heap-allocated because GravelServer contains a large ClientConn array
+     * (MAX_CLIENTS × 64KB arena) which would overflow the default thread stack. */
+    GravelServer *fake_srv = (GravelServer *)calloc(1, sizeof(GravelServer));
+    fake_srv->db = w->db;
+    fake_srv->readonly = true;
+
+    while (*w->running) {
+        int n = io_poller_wait(w->poller, events, WORKER_MAX_CLIENTS + 1, 100);
+        if (n <= 0) continue;
+
+        for (int i = 0; i < n; i++) {
+            IOEvent *ev = &events[i];
+
+            /* New fd delivered via notify pipe */
+            if (ev->userdata == NOTIFY_SENTINEL) {
+                int new_fd = -1;
+                while (read(w->notify_fd, &new_fd, sizeof(new_fd)) == sizeof(new_fd)) {
+                    if (new_fd < 0) continue;
+                    set_nonblocking(new_fd);
+                    set_tcp_nodelay(new_fd);
+                    ClientConn *slot = worker_find_free_slot(w);
+                    if (slot) {
+                        client_init(slot, new_fd);
+                        w->num_clients++;
+                        io_poller_add(w->poller, new_fd, IO_EVENT_READ, slot);
+                    } else {
+                        close(new_fd);
+                    }
+                }
+                continue;
+            }
+
+            ClientConn *c = (ClientConn *)ev->userdata;
+            if (c->fd < 0) continue;
+
+            /* Read */
+            if (ev->events & (IO_EVENT_READ | IO_EVENT_HUP | IO_EVENT_ERROR)) {
+                if (c->recv_len >= c->recv_cap) {
+                    size_t new_cap = c->recv_cap * 2;
+                    if (new_cap > 64 * 1024 * 1024) new_cap = 64 * 1024 * 1024;
+                    if (new_cap <= c->recv_cap) {
+                        io_poller_del(w->poller, c->fd);
+                        client_close(c);
+                        w->num_clients--;
+                        continue;
+                    }
+                    uint8_t *tmp = (uint8_t *)realloc(c->recv_buf, new_cap);
+                    if (!tmp) {
+                        io_poller_del(w->poller, c->fd);
+                        client_close(c);
+                        w->num_clients--;
+                        continue;
+                    }
+                    c->recv_buf = tmp;
+                    c->recv_cap = new_cap;
+                }
+
+                ssize_t rd = read(c->fd, c->recv_buf + c->recv_len,
+                                  c->recv_cap - c->recv_len);
+                if (rd <= 0) {
+                    io_poller_del(w->poller, c->fd);
+                    client_close(c);
+                    w->num_clients--;
+                    continue;
+                }
+                c->recv_len += rd;
+
+                int rc;
+                while ((rc = process_message(fake_srv, c)) > 0) {}
+                if (rc < 0) {
+                    io_poller_del(w->poller, c->fd);
+                    client_close(c);
+                    w->num_clients--;
+                    continue;
+                }
+            }
+
+            /* Write */
+            if (c->send_len > c->send_off) {
+                size_t to_send = c->send_len - c->send_off;
+                ssize_t wr = write(c->fd, c->send_buf + c->send_off, to_send);
+                if (wr > 0) {
+                    c->send_off += wr;
+                    if (c->send_off >= c->send_len) {
+                        c->send_off = 0;
+                        c->send_len = 0;
+                    }
+                } else if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    io_poller_del(w->poller, c->fd);
+                    client_close(c);
+                    w->num_clients--;
+                    continue;
+                }
+            }
+
+            if (c->fd >= 0) {
+                uint32_t interest = IO_EVENT_READ;
+                if (c->send_len > c->send_off) {
+                    interest |= IO_EVENT_WRITE;
+                }
+                io_poller_mod(w->poller, c->fd, interest, c);
+            }
+        }
+    }
+
+    /* Cleanup worker clients */
+    for (int i = 0; i < WORKER_MAX_CLIENTS; i++) {
+        if (w->clients[i].fd >= 0) {
+            io_poller_del(w->poller, w->clients[i].fd);
+            client_close(&w->clients[i]);
+        }
+    }
+    io_poller_destroy(w->poller);
+    close(w->notify_fd);
+    free(fake_srv);
+
+    return NULL;
+}
+
+/* Accept loop for readonly mode: only accepts and distributes fds to workers */
+static void *readonly_accept_loop(void *arg) {
+    GravelServer *srv = (GravelServer *)arg;
+    IOEvent events[4];
+
+    while (srv->running) {
+        int n = io_poller_wait(srv->poller, events, 4, 100);
+        if (n <= 0) continue;
+
+        for (int i = 0; i < n; i++) {
+            struct sockaddr_in addr;
+            socklen_t addr_len = sizeof(addr);
+            int client_fd = accept(srv->listen_fd, (struct sockaddr *)&addr, &addr_len);
+            if (client_fd < 0) continue;
+
+            /* Round-robin distribute to workers */
+            int target = srv->rr_next % srv->num_read_workers;
+            srv->rr_next++;
+
+            /* Send fd to worker via pipe */
+            if (write(srv->worker_pipe_w[target], &client_fd, sizeof(client_fd)) != sizeof(client_fd)) {
+                close(client_fd);  /* pipe full or error, drop connection */
+            }
+        }
+    }
+
+    return NULL;
+}
+
 graveldb_status_t gravel_server_create(GravelServer **out, const GravelServerConfig *config) {
     GravelServer *srv = (GravelServer *)calloc(1, sizeof(GravelServer));
     if (!srv) return GRAVELDB_ERR_OOM;
@@ -594,6 +803,11 @@ graveldb_status_t gravel_server_create(GravelServer **out, const GravelServerCon
     srv->config = *config;
     srv->listen_fd = -1;
     srv->running = 0;
+    srv->readonly = config->readonly;
+    srv->num_read_workers = 0;
+    srv->workers = NULL;
+    srv->worker_pipe_w = NULL;
+    srv->rr_next = 0;
 
     for (int i = 0; i < MAX_CLIENTS; i++) {
         srv->clients[i].fd = -1;
@@ -612,21 +826,24 @@ graveldb_status_t gravel_server_create(GravelServer **out, const GravelServerCon
         return rc;
     }
 
-    CkptConfig ckpt_cfg = {
-        .flush_interval_ms     = config->auto_flush_interval_ms > 0
-                                 ? (uint32_t)config->auto_flush_interval_ms : 1000,
-        .flush_dirty_threshold = 4096,
-        .checkpoint_interval_s = config->auto_checkpoint_interval_s > 0
-                                 ? (uint32_t)config->auto_checkpoint_interval_s : 60,
-        .full_cooldown_ms      = 60000,  /* 60s cooldown between full checkpoints */
-        .auto_recover_on_open  = true,
-    };
-    rc = ckpt_scheduler_init(&srv->ckpt_sched, srv->db, &ckpt_cfg);
-    if (rc != GRAVELDB_OK) {
-        graveldb_close(srv->db);
-        io_poller_destroy(srv->poller);
-        free(srv);
-        return rc;
+    /* Skip checkpoint scheduler in readonly mode — no writes, no flush needed */
+    if (!srv->readonly) {
+        CkptConfig ckpt_cfg = {
+            .flush_interval_ms     = config->auto_flush_interval_ms > 0
+                                     ? (uint32_t)config->auto_flush_interval_ms : 1000,
+            .flush_dirty_threshold = 4096,
+            .checkpoint_interval_s = config->auto_checkpoint_interval_s > 0
+                                     ? (uint32_t)config->auto_checkpoint_interval_s : 60,
+            .full_cooldown_ms      = 60000,  /* 60s cooldown between full checkpoints */
+            .auto_recover_on_open  = true,
+        };
+        rc = ckpt_scheduler_init(&srv->ckpt_sched, srv->db, &ckpt_cfg);
+        if (rc != GRAVELDB_OK) {
+            graveldb_close(srv->db);
+            io_poller_destroy(srv->poller);
+            free(srv);
+            return rc;
+        }
     }
 
     *out = srv;
@@ -665,17 +882,59 @@ graveldb_status_t gravel_server_start(GravelServer *srv) {
 
     srv->running = 1;
 
-    pthread_create(&srv->server_thread, NULL, server_loop, srv);
+    if (srv->readonly && srv->config.num_read_workers > 0) {
+        /* Readonly multi-worker mode: spin up N reader threads */
+        int nw = srv->config.num_read_workers;
+        srv->num_read_workers = nw;
+        srv->workers = (ReadWorker *)calloc(nw, sizeof(ReadWorker));
+        srv->worker_pipe_w = (int *)calloc(nw, sizeof(int));
 
-    fprintf(stderr, "[GravelServer] Listening on port %d (using "
+        for (int i = 0; i < nw; i++) {
+            int pipefd[2];
+            if (pipe(pipefd) < 0) return GRAVELDB_ERR_IO;
+            set_nonblocking(pipefd[0]);
+
+            ReadWorker *w = &srv->workers[i];
+            w->db = srv->db;
+            w->poller = io_poller_create(WORKER_MAX_CLIENTS + 4);
+            w->num_clients = 0;
+            w->notify_fd = pipefd[0];
+            w->running = &srv->running;
+            w->readonly = true;
+            w->worker_id = i;
+
+            for (int j = 0; j < WORKER_MAX_CLIENTS; j++) {
+                w->clients[j].fd = -1;
+            }
+
+            /* Register notify pipe in worker's poller */
+            io_poller_add(w->poller, pipefd[0], IO_EVENT_READ, NOTIFY_SENTINEL);
+
+            srv->worker_pipe_w[i] = pipefd[1];
+
+            pthread_create(&w->thread, NULL, read_worker_loop, w);
+        }
+
+        /* Main thread becomes the accept-only loop */
+        pthread_create(&srv->server_thread, NULL, readonly_accept_loop, srv);
+
+        fprintf(stderr, "[GravelServer] Listening on port %d, READONLY mode"
+                " with %d reader workers (lock-free)\n", port, nw);
+    } else {
+        /* Normal single-threaded event loop (read-write or readonly with 1 thread) */
+        pthread_create(&srv->server_thread, NULL, server_loop, srv);
+
+        fprintf(stderr, "[GravelServer] Listening on port %d%s (using "
 #if defined(__linux__)
-            "epoll"
+                "epoll"
 #elif defined(__APPLE__) || defined(__FreeBSD__)
-            "kqueue"
+                "kqueue"
 #else
-            "poll"
+                "poll"
 #endif
-            ")\n", port);
+                ")\n", port, srv->readonly ? " [READONLY]" : "");
+    }
+
     return GRAVELDB_OK;
 }
 
@@ -684,6 +943,12 @@ void gravel_server_stop(GravelServer *srv) {
 
     srv->running = 0;
     pthread_join(srv->server_thread, NULL);
+
+    /* Join read workers (they check srv->running and exit) */
+    for (int i = 0; i < srv->num_read_workers; i++) {
+        pthread_join(srv->workers[i].thread, NULL);
+        close(srv->worker_pipe_w[i]);
+    }
 
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (srv->clients[i].fd >= 0) {
@@ -698,16 +963,22 @@ void gravel_server_stop(GravelServer *srv) {
         srv->listen_fd = -1;
     }
 
-    ckpt_scheduler_force_flush(&srv->ckpt_sched);
-    ckpt_scheduler_force_checkpoint(&srv->ckpt_sched);
+    if (!srv->readonly) {
+        ckpt_scheduler_force_flush(&srv->ckpt_sched);
+        ckpt_scheduler_force_checkpoint(&srv->ckpt_sched);
+    }
 }
 
 void gravel_server_destroy(GravelServer *srv) {
     if (!srv) return;
     gravel_server_stop(srv);
-    ckpt_scheduler_destroy(&srv->ckpt_sched);
+    if (!srv->readonly) {
+        ckpt_scheduler_destroy(&srv->ckpt_sched);
+    }
     graveldb_close(srv->db);
     io_poller_destroy(srv->poller);
+    free(srv->workers);
+    free(srv->worker_pipe_w);
     free(srv);
 }
 

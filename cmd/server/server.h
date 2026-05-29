@@ -24,6 +24,8 @@ typedef struct {
     size_t          max_request_size;
     int             auto_flush_interval_ms;
     int             auto_checkpoint_interval_s;
+    bool            readonly;           /* readonly mode: no writes, no flush/ckpt */
+    int             num_read_workers;   /* readonly mode: number of reader threads (0=auto) */
 } GravelServerConfig;
 
 typedef struct GravelServer GravelServer;

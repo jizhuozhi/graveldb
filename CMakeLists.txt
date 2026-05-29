@@ -32,8 +32,11 @@ target_include_directories(graveldb_lib PRIVATE src)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     find_library(LIBURING uring)
     if(LIBURING)
-        target_link_libraries(graveldb_lib ${LIBURING})
-        target_compile_definitions(graveldb_lib PRIVATE GRAVELDB_USE_IO_URING=1)
+        target_link_libraries(graveldb_lib PUBLIC ${LIBURING})
+        target_compile_definitions(graveldb_lib PUBLIC GRAVELDB_USE_IO_URING=1)
+        message(STATUS "Found liburing: ${LIBURING} - io_uring flush enabled")
+    else()
+        message(STATUS "liburing not found - using pwrite+fdatasync fallback")
     endif()
 endif()
 
@@ -119,7 +122,7 @@ target_link_libraries(bench-memory-scaling graveldb_lib pthread m)
 target_include_directories(bench-memory-scaling PRIVATE src)
 
 add_executable(bench-network tests/bench_network.c cmd/server/server.c cmd/server/io_poller.c)
-target_link_libraries(bench-network graveldb_lib graveldb_client pthread)
+target_link_libraries(bench-network graveldb_lib graveldb_client pthread m)
 target_include_directories(bench-network PRIVATE src cmd/server protocol client)
 
 # CTest

@@ -45,12 +45,15 @@ static void print_usage(const char *prog) {
         "  -D <dims>          Comma-separated dim list (default: 32,64,128)\n"
         "  --flush-ms <n>     Auto flush interval in ms (default: 1000)\n"
         "  --checkpoint-s <n> Auto checkpoint interval in seconds (default: 300)\n"
+        "  --readonly         Read-only mode: load from checkpoint, reject writes\n"
+        "  --read-workers <n> Number of reader threads in readonly mode (default: auto)\n"
         "  -h                 Print this help\n"
         "\n"
         "Example:\n"
         "  %s -d /data/embeddings -p 9527 -D 64,128,256 -b 512\n"
+        "  %s -d /data/embeddings -p 9527 --readonly --read-workers 4\n"
         "\n",
-        prog, prog);
+        prog, prog, prog);
 }
 
 #define MAX_CLI_DIMS 64
@@ -79,6 +82,8 @@ int main(int argc, char **argv) {
     int num_dims = 3;
     int flush_ms = 1000;
     int ckpt_s = 300;
+    bool readonly = false;
+    int read_workers = 0;
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -94,6 +99,10 @@ int main(int argc, char **argv) {
             flush_ms = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--checkpoint-s") == 0 && i + 1 < argc) {
             ckpt_s = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--readonly") == 0) {
+            readonly = true;
+        } else if (strcmp(argv[i], "--read-workers") == 0 && i + 1 < argc) {
+            read_workers = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -119,6 +128,8 @@ int main(int argc, char **argv) {
     config.max_request_size = 64 * 1024 * 1024; /* 64MB */
     config.auto_flush_interval_ms = flush_ms;
     config.auto_checkpoint_interval_s = ckpt_s;
+    config.readonly = readonly;
+    config.num_read_workers = read_workers;
 
     /* Setup signals */
     signal(SIGINT, signal_handler);
@@ -133,8 +144,16 @@ int main(int argc, char **argv) {
     fprintf(stderr, "  Dims:       ");
     for (int i = 0; i < num_dims; i++) fprintf(stderr, "%d ", dims[i]);
     fprintf(stderr, "\n");
-    fprintf(stderr, "  Flush:      every %d ms\n", flush_ms);
-    fprintf(stderr, "  Checkpoint: every %d s\n", ckpt_s);
+    if (readonly) {
+        fprintf(stderr, "  Mode:       READONLY (writes rejected, lock-free reads)\n");
+        if (read_workers > 0) {
+            fprintf(stderr, "  Workers:    %d reader threads\n", read_workers);
+        }
+    } else {
+        fprintf(stderr, "  Mode:       READ-WRITE\n");
+        fprintf(stderr, "  Flush:      every %d ms\n", flush_ms);
+        fprintf(stderr, "  Checkpoint: every %d s\n", ckpt_s);
+    }
     fprintf(stderr, "\n");
 
     /* Create and start server */
