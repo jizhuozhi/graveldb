@@ -975,13 +975,28 @@ static void *ro_client_thread_fn(void *arg) {
         graveldb_client_pull(c, fids, batch_sz, outs, odims);
     }
 
-    double t0 = now_sec();
-    for (int i = 0; i < iters; i++) {
-        for (int j = 0; j < batch_sz; j++) fids[j] = (xorshift64(&rng) % RO_PREPOP_N) + 1;
-        graveldb_client_pull(c, fids, batch_sz, outs, odims);
+    if (iters > 0) {
+        /* Iteration-driven mode */
+        double t0 = now_sec();
+        for (int i = 0; i < iters; i++) {
+            for (int j = 0; j < batch_sz; j++) fids[j] = (xorshift64(&rng) % RO_PREPOP_N) + 1;
+            graveldb_client_pull(c, fids, batch_sz, outs, odims);
+        }
+        ta->result->elapsed = now_sec() - t0;
+        ta->result->iters = iters;
+    } else {
+        /* Time-driven mode: run for RO_DURATION_SEC seconds */
+        int completed = 0;
+        double t0 = now_sec();
+        double deadline = t0 + RO_DURATION_SEC;
+        while (now_sec() < deadline) {
+            for (int j = 0; j < batch_sz; j++) fids[j] = (xorshift64(&rng) % RO_PREPOP_N) + 1;
+            graveldb_client_pull(c, fids, batch_sz, outs, odims);
+            completed++;
+        }
+        ta->result->elapsed = now_sec() - t0;
+        ta->result->iters = completed;
     }
-    ta->result->elapsed = now_sec() - t0;
-    ta->result->iters = iters;
     ta->result->batch = batch_sz;
 
     free(fids); free(outs); free(data); free(odims);
