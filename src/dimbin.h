@@ -114,7 +114,7 @@ uint32_t dimbin_alloc_entry(DimBin *s);
 void dimbin_free_entry(DimBin *s, uint32_t entry_idx);
 graveldb_status_t dimbin_get(DimBin *s, uint32_t entry_id, float *buf);
 graveldb_status_t dimbin_put(DimBin *s, uint32_t entry_id, const float *data);
-void dimbin_put_key(DimBin *s, uint32_t entry_idx, uint64_t feat_id);
+graveldb_status_t dimbin_put_key(DimBin *s, uint32_t entry_idx, uint64_t feat_id);
 
 /*
  * Batched key write with user-space coalescing.

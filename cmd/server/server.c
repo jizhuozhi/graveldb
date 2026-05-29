@@ -117,6 +117,24 @@ static void *arena_alloc(ReqArena *a, size_t size) {
     return nb->data;
 }
 
+/* ===== Arena-backed GravelDBCtx adapter =====
+ *
+ * Wraps the per-connection ReqArena as a GravelDBCtx so that engine-internal
+ * temporary allocations (order, key_batch, deferred) go through the arena.
+ * dealloc is NULL → arena mode: engine never frees, we reset after response.
+ */
+static void *arena_ctx_alloc(void *opaque, size_t size) {
+    return arena_alloc((ReqArena *)opaque, size);
+}
+
+static inline GravelDBCtx make_arena_ctx(ReqArena *arena) {
+    GravelDBCtx ctx;
+    ctx.opaque  = arena;
+    ctx.alloc   = arena_ctx_alloc;
+    ctx.dealloc = NULL;  /* arena mode: caller (server) manages lifetime */
+    return ctx;
+}
+
 typedef struct {
     int       fd;
     uint8_t  *recv_buf;
@@ -237,53 +255,69 @@ static void handle_pull(GravelServer *srv, ClientConn *c, const uint8_t *body, u
         return;
     }
 
+    GravelDBCtx ctx = make_arena_ctx(&c->arena);
+
+    /* Parse all feat_ids upfront (8 bytes each, contiguous in wire) */
+    const uint8_t *ptr = body + 4;
+    uint64_t *feat_ids = (uint64_t *)arena_alloc(&c->arena, count * sizeof(uint64_t));
+    if (!feat_ids) {
+        response_begin(c, GRAVELDB_WIRE_ERR);
+        response_finish(c);
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        memcpy(&feat_ids[i], ptr, 8);
+        ptr += 8;
+    }
+
     response_begin(c, GRAVELDB_WIRE_OK);
     response_append(c, &count, 4);
 
-    const uint8_t *ptr = body + 4;
+    /*
+     * Process in chunks to keep scratch memory bounded (~256KB per chunk).
+     * This preserves batch_get's cache-friendly probe loop while avoiding
+     * arena over-allocation for very large batches.
+     */
+    #define PULL_CHUNK_SIZE 64
+    #define PULL_MAX_DIM   1024
 
-    /* Allocate scratch buffer from the request arena — no free() needed */
-    size_t scratch_cap = 1024 * sizeof(float);
-    float *scratch = (float *)arena_alloc(&c->arena, scratch_cap);
+    /* Allocate fixed-size scratch for one chunk — reused across chunks */
+    float  *chunk_scratch = (float *)arena_alloc(&c->arena, (size_t)PULL_CHUNK_SIZE * PULL_MAX_DIM * sizeof(float));
+    float **chunk_bufs    = (float **)arena_alloc(&c->arena, PULL_CHUNK_SIZE * sizeof(float *));
+    int    *chunk_dims    = (int *)arena_alloc(&c->arena, PULL_CHUNK_SIZE * sizeof(int));
 
-    for (uint32_t i = 0; i < count; i++) {
-        uint64_t feat_id;
-        memcpy(&feat_id, ptr, 8);
-        ptr += 8;
+    if (!chunk_scratch || !chunk_bufs || !chunk_dims) {
+        response_begin(c, GRAVELDB_WIRE_ERR);
+        response_finish(c);
+        return;
+    }
 
-        int dim = 0;
+    for (uint32_t i = 0; i < (uint32_t)PULL_CHUNK_SIZE; i++) {
+        chunk_bufs[i] = chunk_scratch + (size_t)i * PULL_MAX_DIM;
+    }
 
-        if (!scratch) {
-            uint32_t d = 0;
-            response_append(c, &d, 4);
-            continue;
+    for (uint32_t off = 0; off < count; off += PULL_CHUNK_SIZE) {
+        uint32_t chunk_n = count - off;
+        if (chunk_n > PULL_CHUNK_SIZE) chunk_n = PULL_CHUNK_SIZE;
+
+        /* Reset dims for this chunk */
+        for (uint32_t i = 0; i < chunk_n; i++) {
+            chunk_dims[i] = 0;
         }
 
-        graveldb_status_t rc = graveldb_get(srv->db, NULL, feat_id, scratch, &dim);
+        graveldb_batch_get(srv->db, &ctx, feat_ids + off, (int)chunk_n, chunk_bufs, chunk_dims);
 
-        if (rc == GRAVELDB_OK && (size_t)dim * sizeof(float) > scratch_cap) {
-            /* Need bigger buffer — arena_alloc a larger one */
-            size_t need = (size_t)dim * sizeof(float);
-            float *bigger = (float *)arena_alloc(&c->arena, need);
-            if (!bigger) {
-                uint32_t d = 0;
-                response_append(c, &d, 4);
-                continue;
+        for (uint32_t i = 0; i < chunk_n; i++) {
+            uint32_t d = (uint32_t)chunk_dims[i];
+            response_append(c, &d, 4);
+            if (d > 0) {
+                response_append(c, chunk_bufs[i], d * sizeof(float));
             }
-            scratch = bigger;
-            scratch_cap = need;
-            graveldb_get(srv->db, NULL, feat_id, scratch, &dim);
-        }
-
-        if (rc == GRAVELDB_OK && dim > 0) {
-            uint32_t d = (uint32_t)dim;
-            response_append(c, &d, 4);
-            response_append(c, scratch, dim * sizeof(float));
-        } else {
-            uint32_t d = 0;
-            response_append(c, &d, 4);
         }
     }
+
+    #undef PULL_CHUNK_SIZE
+    #undef PULL_MAX_DIM
 
     /* No free() — arena will be reset after process_message returns */
     response_finish(c);
@@ -305,8 +339,22 @@ static void handle_push(GravelServer *srv, ClientConn *c, const uint8_t *body, u
         return;
     }
 
+    GravelDBCtx ctx = make_arena_ctx(&c->arena);
+
+    /* Allocate temporary arrays from arena — zero free() needed */
+    uint64_t     *feat_ids   = (uint64_t *)arena_alloc(&c->arena, count * sizeof(uint64_t));
+    int          *dims       = (int *)arena_alloc(&c->arena, count * sizeof(int));
+    const float **embeddings = (const float **)arena_alloc(&c->arena, count * sizeof(const float *));
+
+    if (!feat_ids || !dims || !embeddings) {
+        response_begin(c, GRAVELDB_WIRE_ERR);
+        response_finish(c);
+        return;
+    }
+
     const uint8_t *ptr = body + 4;
     const uint8_t *end = body + body_len;
+    uint32_t actual = 0;
 
     for (uint32_t i = 0; i < count; i++) {
         if (ptr + 12 > end) break;
@@ -318,8 +366,15 @@ static void handle_push(GravelServer *srv, ClientConn *c, const uint8_t *body, u
 
         if (ptr + dim * sizeof(float) > end) break;
 
-        graveldb_put(srv->db, NULL, feat_id, (int)dim, (const float *)ptr);
+        feat_ids[actual]   = feat_id;
+        dims[actual]       = (int)dim;
+        embeddings[actual] = (const float *)ptr;
+        actual++;
         ptr += dim * sizeof(float);
+    }
+
+    if (actual > 0) {
+        graveldb_batch_put(srv->db, &ctx, feat_ids, dims, embeddings, (int)actual);
     }
 
     response_begin(c, GRAVELDB_WIRE_OK);

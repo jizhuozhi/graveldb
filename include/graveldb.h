@@ -34,7 +34,35 @@ typedef enum {
 typedef struct GravelDB GravelDB;
 
 typedef struct GravelDBCtx {
-    void *reserved;  /* unused, kept for ABI stability */
+    /*
+     * Request-scoped allocator (optional).
+     *
+     * Layout: opaque is first so that &ctx == &ctx.opaque, enabling
+     * type-pun and ensuring opaque + alloc share the same cache line
+     * on the hot path (ctx_alloc dereferences both on every call).
+     *
+     * Contract:
+     *   - If alloc != NULL && dealloc != NULL:
+     *       Engine uses the pair for all temp allocations in this call.
+     *       Caller is responsible for ensuring the pair is coherent
+     *       (same allocator backend).
+     *
+     *   - If alloc != NULL && dealloc == NULL:
+     *       Arena mode. Engine will alloc but never free — caller owns
+     *       lifetime (e.g. arena_reset after request completes).
+     *       Engine treats free as a no-op.
+     *
+     *   - If alloc == NULL:
+     *       Fallback to malloc/free. dealloc is ignored.
+     *
+     * CRITICAL: alloc and dealloc must come from the same source.
+     *   Engine will NEVER mix: e.g. ctx->alloc + stdlib free, or
+     *   malloc + ctx->dealloc. The pairing is determined once at call
+     *   entry and used consistently for the entire operation.
+     */
+    void  *opaque;  /* passed as first arg to alloc/dealloc */
+    void *(*alloc)(void *opaque, size_t size);
+    void  (*dealloc)(void *opaque, void *ptr, size_t size);
 } GravelDBCtx;
 
 typedef struct {

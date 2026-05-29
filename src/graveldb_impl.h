@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdlib.h>
 
 #include "graveldb.h"
 #include "dimbin.h"
@@ -130,6 +131,38 @@ typedef struct GravelDB {
 
 void ensure_dir(const char *path);
 uint32_t detect_page_size(const char *path);
+
+/*
+ * Context-aware allocation helpers.
+ *
+ * Rule: alloc and dealloc are ALWAYS resolved as a pair from the same source.
+ *   - ctx->alloc != NULL  → use ctx->alloc for allocation
+ *   - ctx->dealloc != NULL → use ctx->dealloc for deallocation
+ *   - ctx->alloc != NULL && ctx->dealloc == NULL → arena mode (no-op free)
+ *   - ctx == NULL || ctx->alloc == NULL → fallback to malloc/free
+ *
+ * The pair is determined ONCE and used consistently. Never mix sources.
+ */
+static inline void *ctx_alloc(const GravelDBCtx *ctx, size_t size) {
+    if (ctx && ctx->alloc) {
+        return ctx->alloc(ctx->opaque, size);
+    }
+    return malloc(size);
+}
+
+static inline void ctx_dealloc(const GravelDBCtx *ctx, void *ptr, size_t size) {
+    if (!ptr) return;
+    if (ctx && ctx->alloc) {
+        /* Allocation came from ctx->alloc, so dealloc must also go through ctx */
+        if (ctx->dealloc) {
+            ctx->dealloc(ctx->opaque, ptr, size);
+        }
+        /* else: arena mode — caller manages lifetime, no-op here */
+        return;
+    }
+    /* Allocation came from malloc, free with stdlib */
+    free(ptr);
+}
 
 /*
  * Flush all write buffers to disk (internal operation).

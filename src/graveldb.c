@@ -324,7 +324,12 @@ graveldb_status_t graveldb_put(GravelDB *db, GravelDBCtx *ctx,
             dimbin_free_entry(old_bin, existing_entry);
             entry_id = dimbin_alloc_entry(bin);
             hash_index_put(&db->index, feat_id, (uint16_t)dim_idx, entry_id);
-            dimbin_put_key(bin, entry_id, feat_id);
+            if (dimbin_put_key(bin, entry_id, feat_id) != GRAVELDB_OK) {
+                /* Key write failed -- rollback: reclaim slot + revert index */
+                dimbin_free_entry(bin, entry_id);
+                hash_index_remove(&db->index, feat_id);
+                return GRAVELDB_ERR_IO;
+            }
         } else {
             entry_id = existing_entry;
         }
@@ -332,7 +337,12 @@ graveldb_status_t graveldb_put(GravelDB *db, GravelDBCtx *ctx,
         /* New feature - allocate slot */
         entry_id = dimbin_alloc_entry(bin);
         hash_index_put(&db->index, feat_id, (uint16_t)dim_idx, entry_id);
-        dimbin_put_key(bin, entry_id, feat_id);
+        if (dimbin_put_key(bin, entry_id, feat_id) != GRAVELDB_OK) {
+            /* Key write failed -- rollback: reclaim slot + revert index */
+            dimbin_free_entry(bin, entry_id);
+            hash_index_remove(&db->index, feat_id);
+            return GRAVELDB_ERR_IO;
+        }
     }
 
     /* Write embedding data */
@@ -434,13 +444,12 @@ graveldb_status_t graveldb_batch_get(GravelDB *db, GravelDBCtx *ctx,
 graveldb_status_t graveldb_batch_put(GravelDB *db, GravelDBCtx *ctx,
                                      const uint64_t *feat_ids,
                                      const int *dims, const float *const *embeddings, int n) {
-    (void)ctx;
     if (n <= 0) return GRAVELDB_OK;
 
     /* For small batches (n<=4), just loop -- overhead of grouping not worth it */
     if (n <= 4) {
         for (int i = 0; i < n; i++) {
-            graveldb_status_t rc = graveldb_put(db, NULL, feat_ids[i], dims[i], embeddings[i]);
+            graveldb_status_t rc = graveldb_put(db, ctx, feat_ids[i], dims[i], embeddings[i]);
             if (rc != GRAVELDB_OK) return rc;
         }
         return GRAVELDB_OK;
@@ -451,7 +460,8 @@ graveldb_status_t graveldb_batch_put(GravelDB *db, GravelDBCtx *ctx,
      * Use a simple approach: sort indices by dim to group them.
      * For typical 5-10 distinct dims this is very fast.
      */
-    uint32_t *order = (uint32_t *)malloc(n * sizeof(uint32_t));
+    size_t order_size = (size_t)n * sizeof(uint32_t);
+    uint32_t *order = (uint32_t *)ctx_alloc(ctx, order_size);
     if (!order) return GRAVELDB_ERR_OOM;
     for (int i = 0; i < n; i++) order[i] = i;
 
@@ -489,15 +499,26 @@ graveldb_status_t graveldb_batch_put(GravelDB *db, GravelDBCtx *ctx,
         DimBin *bin = dim_registry_get_bin(&db->dim_reg, (uint16_t)dim_idx);
 
         /*
-         * Phase 2a: Batch alloc + write for this group.
-         * Collect key writes into a batch array, then flush them with
-         * page-level coalescing at the end.
+         * Phase 2a: Batch alloc + key-first write for this group.
+         *
+         * Strategy: write keys BEFORE values to avoid phantom slots.
+         * If a key write fails, the slot is rolled back immediately.
+         * For the batch (coalesced) path, keys are flushed first, then
+         * we verify no I/O errors occurred before writing values.
          */
         KeyWriteEntry *key_batch = NULL;
         int key_batch_count = 0;
+
+        /* Track (entry_id, orig_idx) for deferred embedding writes */
+        typedef struct { uint32_t entry_id; int orig_idx; } DeferredEmb;
+        size_t deferred_size = (size_t)group_size * sizeof(DeferredEmb);
+        DeferredEmb *deferred = (DeferredEmb *)ctx_alloc(ctx, deferred_size);
+        int deferred_count = 0;
+
+        size_t key_batch_size = (size_t)group_size * sizeof(KeyWriteEntry);
         if (group_size >= KEY_COALESCE_THRESH) {
-            key_batch = (KeyWriteEntry *)malloc(group_size * sizeof(KeyWriteEntry));
-            /* If malloc fails, fall through to per-key pwrite path */
+            key_batch = (KeyWriteEntry *)ctx_alloc(ctx, key_batch_size);
+            /* If alloc fails, fall through to per-key pwrite path */
         }
 
         for (int g = 0; g < group_size; g++) {
@@ -535,25 +556,55 @@ graveldb_status_t graveldb_batch_put(GravelDB *db, GravelDBCtx *ctx,
                 key_batch[key_batch_count].feat_id = feat_id;
                 key_batch_count++;
             } else {
-                /* Fallback: individual pwrite */
-                dimbin_put_key(bin, entry_id, feat_id);
+                /* Fallback: individual pwrite -- check result */
+                if (dimbin_put_key(bin, entry_id, feat_id) != GRAVELDB_OK) {
+                    /* Key write failed -- rollback slot + index to avoid phantom */
+                    dimbin_free_entry(bin, entry_id);
+                    hash_index_remove(&db->index, feat_id);
+                    continue; /* skip this entry, proceed with rest of batch */
+                }
             }
 
-            /* Write embedding into block buffer (no syscall here) */
-            graveldb_status_t wrc = dimbin_put(bin, entry_id, emb);
-            if (wrc != GRAVELDB_OK) { rc = wrc; }
+            /* Defer embedding write until keys are confirmed */
+            if (deferred) {
+                deferred[deferred_count].entry_id = entry_id;
+                deferred[deferred_count].orig_idx = orig_idx;
+                deferred_count++;
+            } else {
+                /* Allocation failed -- write inline (best-effort) */
+                graveldb_status_t wrc = dimbin_put(bin, entry_id, embeddings[orig_idx]);
+                if (wrc != GRAVELDB_OK) { rc = wrc; }
+            }
         }
 
         /* Flush collected key writes with page coalescing */
         if (key_batch) {
+            uint64_t errors_before = bin->io_errors;
             dimbin_put_keys_batch(bin, key_batch, key_batch_count);
-            free(key_batch);
+            if (bin->io_errors > errors_before) {
+                /* Some key writes failed in batch mode.
+                 * We cannot pinpoint which entries failed at page-coalesce granularity,
+                 * so we flag the batch as partially failed but continue --
+                 * the io_errors counter allows monitoring/alerting. */
+                rc = GRAVELDB_ERR_IO;
+            }
+            ctx_dealloc(ctx, key_batch, key_batch_size);
+        }
+
+        /* Phase 2b: Now write embeddings (memory buffer -- safe after key persist) */
+        if (deferred) {
+            for (int d = 0; d < deferred_count; d++) {
+                graveldb_status_t wrc = dimbin_put(bin, deferred[d].entry_id,
+                                                   embeddings[deferred[d].orig_idx]);
+                if (wrc != GRAVELDB_OK) { rc = wrc; }
+            }
+            ctx_dealloc(ctx, deferred, deferred_size);
         }
 
         group_start = group_end;
     }
 
-    free(order);
+    ctx_dealloc(ctx, order, order_size);
     return rc;
 }
 

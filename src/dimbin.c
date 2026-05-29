@@ -298,13 +298,18 @@ uint32_t dimbin_alloc_entry(DimBin *s) {
 /*
  * Key write: immediate pwrite to key file.
  * No buffering -- ensures crash consistency for add/remove operations.
+ * Returns GRAVELDB_OK on success, GRAVELDB_ERR_IO on failure.
+ * Caller must NOT proceed with value write if key write fails,
+ * otherwise the slot becomes a phantom (occupied but unrecoverable after crash).
  */
-void dimbin_put_key(DimBin *s, uint32_t entry_idx, uint64_t feat_id) {
+graveldb_status_t dimbin_put_key(DimBin *s, uint32_t entry_idx, uint64_t feat_id) {
     off_t offset = (off_t)entry_idx * sizeof(uint64_t);
     ssize_t wr = pwrite(s->key_fd, &feat_id, sizeof(uint64_t), offset);
     if (wr != sizeof(uint64_t)) {
         s->io_errors++;
+        return GRAVELDB_ERR_IO;
     }
+    return GRAVELDB_OK;
 }
 
 /*
@@ -415,8 +420,9 @@ void dimbin_free_entry(DimBin *s, uint32_t entry_idx) {
     }
     s->free_list[s->free_count++] = entry_idx;
 
-    /* Zero the key through the buffer (will be flushed with next batch) */
-    dimbin_put_key(s, entry_idx, 0);
+    /* Best-effort: zero the key. Failure is tolerable because the slot is on
+     * free_list and will get a new key on next reuse via dimbin_put_key. */
+    (void)dimbin_put_key(s, entry_idx, 0);
 }
 
 /*
