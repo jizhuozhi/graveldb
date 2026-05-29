@@ -16,6 +16,7 @@
  */
 
 #include "io_uring_flush.h"
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -170,8 +171,6 @@ bool uring_flush_available(void) {
 }
 
 #else /* !GRAVELDB_USE_IO_URING -- fallback for macOS / non-Linux */
-
-#include <stdlib.h>
 
 /*
  * Fallback implementation: pwrite each block immediately on submit,
