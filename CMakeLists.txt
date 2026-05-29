@@ -47,7 +47,7 @@ add_executable(graveldb-server
     cmd/server/io_poller.c
 )
 target_link_libraries(graveldb-server graveldb_lib pthread)
-target_include_directories(graveldb-server PRIVATE src cmd/server protocol)
+target_include_directories(graveldb-server PRIVATE include cmd/server protocol)
 
 # Client Library
 add_library(graveldb_client STATIC
@@ -117,9 +117,13 @@ add_executable(bench-memory-scaling tests/bench_memory_scaling.c)
 target_link_libraries(bench-memory-scaling graveldb_lib pthread m)
 target_include_directories(bench-memory-scaling PRIVATE src)
 
-add_executable(bench-network tests/bench_network.c cmd/server/server.c cmd/server/io_poller.c)
-target_link_libraries(bench-network graveldb_lib graveldb_client pthread m)
-target_include_directories(bench-network PRIVATE src cmd/server protocol client)
+add_executable(bench-network tests/bench_network.c)
+target_link_libraries(bench-network graveldb_client pthread m)
+target_include_directories(bench-network PRIVATE client)
+
+add_executable(bench-network-scale tests/bench_network_scale.c)
+target_link_libraries(bench-network-scale graveldb_client pthread m)
+target_include_directories(bench-network-scale PRIVATE client)
 
 # CTest
 enable_testing()

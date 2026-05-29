@@ -8,9 +8,8 @@
 #ifndef GRAVELDB_SERVER_H_
 #define GRAVELDB_SERVER_H_
 
-#include "../../include/graveldb.h"
-#include "../../protocol/graveldb_wire.h"
-#include "../../src/graveldb_impl.h"
+#include "graveldb.h"
+#include "graveldb_wire.h"
 
 #ifdef __cplusplus
 extern "C" {

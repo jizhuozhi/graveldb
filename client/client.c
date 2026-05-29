@@ -21,6 +21,7 @@ struct GravelDBClient {
     size_t    send_cap;
     uint8_t  *recv_buf;
     size_t    recv_cap;
+    int       pending;    /* number of responses not yet consumed */
 };
 
 static int send_all(int fd, const void *buf, size_t len) {
@@ -178,8 +179,9 @@ int graveldb_client_pull(GravelDBClient *c, const uint64_t *feat_ids, int n,
     return 0;
 }
 
-int graveldb_client_push(GravelDBClient *c, const uint64_t *feat_ids,
-                         const int *dims, const float *const *embeddings, int n) {
+/* Serialize a push body into send_buf. Returns body length, or 0 on realloc failure. */
+static size_t push_serialize(GravelDBClient *c, const uint64_t *feat_ids,
+                             const int *dims, const float *const *embeddings, int n) {
     size_t body_len = 4;
     for (int i = 0; i < n; i++) {
         body_len += 8 + 4 + dims[i] * sizeof(float);
@@ -187,7 +189,9 @@ int graveldb_client_push(GravelDBClient *c, const uint64_t *feat_ids,
 
     if (body_len > c->send_cap) {
         c->send_cap = body_len;
-        c->send_buf = (uint8_t *)realloc(c->send_buf, c->send_cap);
+        uint8_t *tmp = (uint8_t *)realloc(c->send_buf, c->send_cap);
+        if (!tmp) return 0;
+        c->send_buf = tmp;
     }
 
     uint8_t *ptr = c->send_buf;
@@ -201,6 +205,13 @@ int graveldb_client_push(GravelDBClient *c, const uint64_t *feat_ids,
         memcpy(ptr, embeddings[i], dims[i] * sizeof(float));
         ptr += dims[i] * sizeof(float);
     }
+    return body_len;
+}
+
+int graveldb_client_push(GravelDBClient *c, const uint64_t *feat_ids,
+                         const int *dims, const float *const *embeddings, int n) {
+    size_t body_len = push_serialize(c, feat_ids, dims, embeddings, n);
+    if (body_len == 0) return -1;
 
     if (send_request(c, GRAVELDB_MSG_PUSH, c->send_buf, (uint32_t)body_len) < 0) return -1;
 
@@ -208,6 +219,36 @@ int graveldb_client_push(GravelDBClient *c, const uint64_t *feat_ids,
     uint8_t *body;
     if (recv_response(c, &status, &body, &resp_len) < 0) return -1;
     return (status == GRAVELDB_WIRE_OK) ? 0 : -1;
+}
+
+int graveldb_client_push_async(GravelDBClient *c, const uint64_t *feat_ids,
+                               const int *dims, const float *const *embeddings, int n) {
+    size_t body_len = push_serialize(c, feat_ids, dims, embeddings, n);
+    if (body_len == 0) return -1;
+
+    if (send_request(c, GRAVELDB_MSG_PUSH, c->send_buf, (uint32_t)body_len) < 0) return -1;
+    c->pending++;
+    return 0;
+}
+
+int graveldb_client_await(GravelDBClient *c, int max_drain) {
+    int drained = 0;
+    int errors = 0;
+    if (max_drain <= 0) max_drain = c->pending;
+
+    while (drained < max_drain && c->pending > 0) {
+        uint32_t status, resp_len;
+        uint8_t *body;
+        if (recv_response(c, &status, &body, &resp_len) < 0) return -1;
+        if (status != GRAVELDB_WIRE_OK) errors++;
+        c->pending--;
+        drained++;
+    }
+    return errors;
+}
+
+int graveldb_client_pending(GravelDBClient *c) {
+    return c->pending;
 }
 
 int graveldb_client_delete(GravelDBClient *c, const uint64_t *feat_ids, int n) {

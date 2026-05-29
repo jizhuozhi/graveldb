@@ -116,6 +116,9 @@ bench: build
 bench-net: build
 	@$(BUILD_DIR)/bench-network
 
+bench-net-scale: build
+	@$(BUILD_DIR)/bench-network-scale
+
 bench-lat: build
 	@$(BUILD_DIR)/bench-latency
 

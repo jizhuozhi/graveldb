@@ -6,7 +6,6 @@
  */
 
 #include "server.h"
-#include "../../src/checkpoint.h"
 #include "io_poller.h"
 #include <stdlib.h>
 #include <string.h>
@@ -20,17 +19,23 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <sys/uio.h>
 #include <pthread.h>
 
 #define MAX_CLIENTS     256
 #define READ_BUF_SIZE   (16 * 1024 * 1024)
 
-/* ===== Request-scoped Arena Allocator (nginx-style pool) =====
+/* Request-scoped Arena Allocator (nginx-style pool)
  *
- * Each connection owns a small arena. All temporary allocations during
- * request processing (e.g. the float buffer in handle_pull) come from
- * this arena. After the response is built the arena is reset to zero —
- * no individual free() calls needed.
+ * Each connection owns a single arena. All allocations during request
+ * processing — scratch buffers, SendChunk structs, response body buffers —
+ * come from this arena.
+ *
+ * Lifetime: the arena is NOT reset after process_message returns. Instead,
+ * it stays alive until client_flush_send has written out all pending chunks
+ * (i.e. the send queue is drained). At that point the arena is reset in O(1).
+ * This ensures SendChunks remain valid through writev without needing any
+ * per-chunk malloc/free or freelist.
  *
  * The arena starts with a single inline block; if a request needs more
  * space it chains additional blocks. On reset, extra blocks are freed
@@ -135,16 +140,32 @@ static inline GravelDBCtx make_arena_ctx(ReqArena *arena) {
     return ctx;
 }
 
+/*
+ * SendChunk: linked list of output buffers for scatter-write.
+ * Each response occupies one chunk. On flush we writev() all pending
+ * chunks, then release completed ones. No realloc, no memmove.
+ */
+#define SEND_CHUNK_INLINE 4096
+
+typedef struct SendChunk {
+    struct SendChunk *next;
+    uint8_t *data;
+    size_t   len;       /* bytes written into this chunk */
+    size_t   cap;
+    size_t   sent;      /* bytes already sent (partial write) */
+    uint8_t  inline_buf[SEND_CHUNK_INLINE];
+} SendChunk;
+
 typedef struct {
     int       fd;
     uint8_t  *recv_buf;
     size_t    recv_len;
     size_t    recv_cap;
-    uint8_t  *send_buf;
-    size_t    send_len;
-    size_t    send_off;
-    size_t    send_cap;
-    ReqArena  arena;      /* per-request scratch allocator */
+    SendChunk *send_head;    /* first pending chunk */
+    SendChunk *send_tail;    /* last pending chunk (append here) */
+    SendChunk *send_cur;     /* chunk currently being built by response_* */
+    size_t     resp_hdr_off; /* offset of response header within send_cur */
+    ReqArena  arena;         /* per-request arena; lifetime extended until flush completes */
 } ClientConn;
 
 /* ===== Read Worker (readonly mode multi-threaded reads) =====
@@ -174,7 +195,8 @@ typedef struct {
 struct GravelServer {
     GravelServerConfig config;
     GravelDB      *db;
-    CkptScheduler  ckpt_sched;
+    uint64_t       last_checkpoint_ms;
+    uint32_t       checkpoint_interval_ms;
     int            listen_fd;
     volatile int   running;
     bool           readonly;
@@ -215,59 +237,152 @@ static ClientConn *find_free_slot(GravelServer *srv) {
     return NULL;
 }
 
+/*
+ * Allocate a SendChunk from the connection's arena. Since arena lifetime
+ * is extended until flush completes, the chunk lives long enough for writev.
+ * Zero malloc per request in steady state.
+ */
+static SendChunk *chunk_arena_new(ClientConn *c) {
+    SendChunk *ch = (SendChunk *)arena_alloc(&c->arena, sizeof(SendChunk));
+    if (!ch) return NULL;
+    ch->next = NULL;
+    ch->len  = 0;
+    ch->sent = 0;
+    ch->data = ch->inline_buf;
+    ch->cap  = SEND_CHUNK_INLINE;
+    return ch;
+}
+
 static void client_init(ClientConn *c, int fd) {
     c->fd = fd;
     c->recv_cap = READ_BUF_SIZE;
     c->recv_buf = (uint8_t *)malloc(c->recv_cap);
     c->recv_len = 0;
-    c->send_cap = READ_BUF_SIZE;
-    c->send_buf = (uint8_t *)malloc(c->send_cap);
-    c->send_len = 0;
-    c->send_off = 0;
+    c->send_head = NULL;
+    c->send_tail = NULL;
+    c->send_cur  = NULL;
+    c->resp_hdr_off = 0;
     arena_init(&c->arena);
 }
 
 static void client_close(ClientConn *c) {
     if (c->fd >= 0) close(c->fd);
     free(c->recv_buf);
-    free(c->send_buf);
+    /* All SendChunks and their grown buffers live in the arena */
     arena_destroy(&c->arena);
     c->fd = -1;
     c->recv_buf = NULL;
-    c->send_buf = NULL;
+    c->send_head = NULL;
+    c->send_tail = NULL;
+    c->send_cur  = NULL;
     c->recv_len = 0;
-    c->send_len = 0;
+}
+
+/* Returns true if there are pending chunks to send */
+static inline bool client_has_pending_send(ClientConn *c) {
+    return c->send_head != NULL;
+}
+
+/*
+ * Flush pending send chunks via writev. Non-blocking: sends as much as
+ * the socket allows, frees fully-sent chunks, returns:
+ *   0  = all flushed
+ *   1  = partial (EAGAIN), still has pending
+ *  -1  = error (connection should be closed)
+ */
+static int client_flush_send(ClientConn *c) {
+    while (c->send_head) {
+        /* Build iovec array from chunk list (up to IOV_MAX or 64) */
+        struct iovec iov[64];
+        int iovcnt = 0;
+        SendChunk *ch = c->send_head;
+        while (ch && iovcnt < 64) {
+            iov[iovcnt].iov_base = ch->data + ch->sent;
+            iov[iovcnt].iov_len  = ch->len - ch->sent;
+            iovcnt++;
+            ch = ch->next;
+        }
+
+        ssize_t wr = writev(c->fd, iov, iovcnt);
+        if (wr <= 0) {
+            if (wr < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                return 1;  /* partial */
+            return -1;     /* error */
+        }
+
+        /* Advance: consume written bytes from head chunks */
+        size_t remaining = (size_t)wr;
+        while (remaining > 0 && c->send_head) {
+            SendChunk *head = c->send_head;
+            size_t avail = head->len - head->sent;
+            if (remaining >= avail) {
+                remaining -= avail;
+                c->send_head = head->next;
+                if (!c->send_head) c->send_tail = NULL;
+                /* chunk struct + data both in arena, no free needed */
+            } else {
+                head->sent += remaining;
+                remaining = 0;
+            }
+        }
+    }
+    /* All chunks flushed — reset arena to reclaim all memory in O(1) */
+    arena_reset(&c->arena);
+    return 0;  /* all flushed */
 }
 
 static void response_begin(ClientConn *c, graveldb_wire_status_t status) {
-    c->send_len = 0;
-    c->send_off = 0;
+    /* Allocate chunk from arena (zero malloc) */
+    SendChunk *ch = chunk_arena_new(c);
+    if (!ch) return;
+    c->send_cur = ch;
+    c->resp_hdr_off = 0;
 
     uint32_t magic = GRAVELDB_WIRE_MAGIC;
     uint32_t st = (uint32_t)status;
-    uint32_t body_len = 0;
+    uint32_t body_len = 0;  /* placeholder, patched by response_finish */
 
-    memcpy(c->send_buf, &magic, 4);
-    memcpy(c->send_buf + 4, &st, 4);
-    memcpy(c->send_buf + 8, &body_len, 4);
-    c->send_len = GRAVELDB_WIRE_HEADER_SIZE;
+    memcpy(ch->data, &magic, 4);
+    memcpy(ch->data + 4, &st, 4);
+    memcpy(ch->data + 8, &body_len, 4);
+    ch->len = GRAVELDB_WIRE_HEADER_SIZE;
 }
 
 static void response_append(ClientConn *c, const void *data, size_t len) {
-    if (c->send_len + len > c->send_cap) {
-        size_t new_cap = (c->send_len + len) * 2;
-        uint8_t *tmp = (uint8_t *)realloc(c->send_buf, new_cap);
-        if (!tmp) return;
-        c->send_buf = tmp;
-        c->send_cap = new_cap;
+    SendChunk *ch = c->send_cur;
+    if (!ch) return;
+    /* Grow chunk if needed: allocate from arena (no individual free needed).
+     * Arena doesn't support realloc, so we alloc a new buffer and copy.
+     * This only happens for large responses (e.g. big pull batches). */
+    if (ch->len + len > ch->cap) {
+        size_t new_cap = (ch->len + len) * 2;
+        uint8_t *new_buf = (uint8_t *)arena_alloc(&c->arena, new_cap);
+        if (!new_buf) return;
+        memcpy(new_buf, ch->data, ch->len);
+        ch->data = new_buf;
+        ch->cap = new_cap;
     }
-    memcpy(c->send_buf + c->send_len, data, len);
-    c->send_len += len;
+    memcpy(ch->data + ch->len, data, len);
+    ch->len += len;
 }
 
 static void response_finish(ClientConn *c) {
-    uint32_t body_len = (uint32_t)(c->send_len - GRAVELDB_WIRE_HEADER_SIZE);
-    memcpy(c->send_buf + 8, &body_len, 4);
+    SendChunk *ch = c->send_cur;
+    if (!ch) return;
+
+    /* Patch body_len in header */
+    uint32_t body_len = (uint32_t)(ch->len - GRAVELDB_WIRE_HEADER_SIZE);
+    memcpy(ch->data + 8, &body_len, 4);
+
+    /* Enqueue chunk into send list */
+    ch->next = NULL;
+    if (c->send_tail) {
+        c->send_tail->next = ch;
+    } else {
+        c->send_head = ch;
+    }
+    c->send_tail = ch;
+    c->send_cur = NULL;
 }
 
 static void handle_pull(GravelServer *srv, ClientConn *c, const uint8_t *body, uint32_t body_len) {
@@ -350,7 +465,6 @@ static void handle_pull(GravelServer *srv, ClientConn *c, const uint8_t *body, u
     #undef PULL_CHUNK_SIZE
     #undef PULL_MAX_DIM
 
-    /* No free() — arena will be reset after process_message returns */
     response_finish(c);
 }
 
@@ -434,13 +548,13 @@ static void handle_delete(GravelServer *srv, ClientConn *c, const uint8_t *body,
 }
 
 static void handle_flush(GravelServer *srv, ClientConn *c) {
-    ckpt_scheduler_force_flush(&srv->ckpt_sched);
+    graveldb_checkpoint(srv->db);
     response_begin(c, GRAVELDB_WIRE_OK);
     response_finish(c);
 }
 
 static void handle_checkpoint(GravelServer *srv, ClientConn *c) {
-    ckpt_scheduler_force_checkpoint(&srv->ckpt_sched);
+    graveldb_checkpoint(srv->db);
     response_begin(c, GRAVELDB_WIRE_OK);
     response_finish(c);
 }
@@ -502,8 +616,8 @@ static int process_message(GravelServer *srv, ClientConn *c) {
             break;
     }
 
-    /* Reset the per-request arena — all scratch memory is reclaimed in O(1) */
-    arena_reset(&c->arena);
+    /* Arena reset is deferred — happens in client_flush_send after all
+     * chunks are fully written. This keeps SendChunks alive through writev. */
 
     size_t consumed = GRAVELDB_WIRE_HEADER_SIZE + body_len;
     size_t remaining = c->recv_len - consumed;
@@ -524,8 +638,12 @@ static void *server_loop(void *arg) {
     while (srv->running) {
         int n = io_poller_wait(srv->poller, events, MAX_CLIENTS + 1, 100);
 
-        if (!srv->readonly) {
-            ckpt_scheduler_tick(&srv->ckpt_sched, now_ms());
+        if (!srv->readonly && srv->checkpoint_interval_ms > 0) {
+            uint64_t now = now_ms();
+            if (now - srv->last_checkpoint_ms >= srv->checkpoint_interval_ms) {
+                graveldb_checkpoint(srv->db);
+                srv->last_checkpoint_ms = now;
+            }
         }
 
         if (n <= 0) continue;
@@ -599,17 +717,10 @@ static void *server_loop(void *arg) {
                 }
             }
 
-            /* Write — try to flush pending response data immediately */
-            if (c->send_len > c->send_off) {
-                size_t to_send = c->send_len - c->send_off;
-                ssize_t wr = write(c->fd, c->send_buf + c->send_off, to_send);
-                if (wr > 0) {
-                    c->send_off += wr;
-                    if (c->send_off >= c->send_len) {
-                        c->send_off = 0;
-                        c->send_len = 0;
-                    }
-                } else if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            /* Write — flush pending send chunks */
+            if (client_has_pending_send(c)) {
+                int wr_rc = client_flush_send(c);
+                if (wr_rc < 0) {
                     io_poller_del(srv->poller, c->fd);
                     client_close(c);
                     srv->num_clients--;
@@ -619,7 +730,7 @@ static void *server_loop(void *arg) {
 
             if (c->fd >= 0) {
                 uint32_t interest = IO_EVENT_READ;
-                if (c->send_len > c->send_off) {
+                if (client_has_pending_send(c)) {
                     interest |= IO_EVENT_WRITE;
                 }
                 io_poller_mod(srv->poller, c->fd, interest, c);
@@ -726,16 +837,9 @@ static void *read_worker_loop(void *arg) {
             }
 
             /* Write */
-            if (c->send_len > c->send_off) {
-                size_t to_send = c->send_len - c->send_off;
-                ssize_t wr = write(c->fd, c->send_buf + c->send_off, to_send);
-                if (wr > 0) {
-                    c->send_off += wr;
-                    if (c->send_off >= c->send_len) {
-                        c->send_off = 0;
-                        c->send_len = 0;
-                    }
-                } else if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            if (client_has_pending_send(c)) {
+                int wr_rc = client_flush_send(c);
+                if (wr_rc < 0) {
                     io_poller_del(w->poller, c->fd);
                     client_close(c);
                     w->num_clients--;
@@ -745,7 +849,7 @@ static void *read_worker_loop(void *arg) {
 
             if (c->fd >= 0) {
                 uint32_t interest = IO_EVENT_READ;
-                if (c->send_len > c->send_off) {
+                if (client_has_pending_send(c)) {
                     interest |= IO_EVENT_WRITE;
                 }
                 io_poller_mod(w->poller, c->fd, interest, c);
@@ -826,24 +930,12 @@ graveldb_status_t gravel_server_create(GravelServer **out, const GravelServerCon
         return rc;
     }
 
-    /* Skip checkpoint scheduler in readonly mode — no writes, no flush needed */
+    /* Setup checkpoint timing (only in read-write mode) */
     if (!srv->readonly) {
-        CkptConfig ckpt_cfg = {
-            .flush_interval_ms     = config->auto_flush_interval_ms > 0
-                                     ? (uint32_t)config->auto_flush_interval_ms : 1000,
-            .flush_dirty_threshold = 4096,
-            .checkpoint_interval_s = config->auto_checkpoint_interval_s > 0
-                                     ? (uint32_t)config->auto_checkpoint_interval_s : 60,
-            .full_cooldown_ms      = 60000,  /* 60s cooldown between full checkpoints */
-            .auto_recover_on_open  = true,
-        };
-        rc = ckpt_scheduler_init(&srv->ckpt_sched, srv->db, &ckpt_cfg);
-        if (rc != GRAVELDB_OK) {
-            graveldb_close(srv->db);
-            io_poller_destroy(srv->poller);
-            free(srv);
-            return rc;
-        }
+        uint32_t interval_s = config->auto_checkpoint_interval_s > 0
+                              ? (uint32_t)config->auto_checkpoint_interval_s : 60;
+        srv->checkpoint_interval_ms = interval_s * 1000;
+        srv->last_checkpoint_ms = now_ms();
     }
 
     *out = srv;
@@ -964,17 +1056,13 @@ void gravel_server_stop(GravelServer *srv) {
     }
 
     if (!srv->readonly) {
-        ckpt_scheduler_force_flush(&srv->ckpt_sched);
-        ckpt_scheduler_force_checkpoint(&srv->ckpt_sched);
+        graveldb_checkpoint(srv->db);
     }
 }
 
 void gravel_server_destroy(GravelServer *srv) {
     if (!srv) return;
     gravel_server_stop(srv);
-    if (!srv->readonly) {
-        ckpt_scheduler_destroy(&srv->ckpt_sched);
-    }
     graveldb_close(srv->db);
     io_poller_destroy(srv->poller);
     free(srv->workers);

@@ -119,8 +119,6 @@ int main(int argc, char **argv) {
     config.db_config.dims = dims;
     config.db_config.buffer_size = buffer_mb * 1024 * 1024;
     config.db_config.index_capacity = 1 << 24; /* 16M */
-    config.db_config.delta_chain_max = GRAVELDB_DELTA_CHAIN_MAX;
-    config.db_config.dirty_ratio_full = GRAVELDB_DIRTY_RATIO_FULL;
 
     config.port = port;
     config.num_workers = 0;

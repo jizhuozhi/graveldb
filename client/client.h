@@ -46,6 +46,20 @@ int graveldb_client_push(GravelDBClient *client,
                          const int *dims,
                          const float *const *embeddings, int n);
 
+/* Push async: send request without waiting for response.
+ * Call graveldb_client_await() later to drain pending responses. */
+int graveldb_client_push_async(GravelDBClient *client,
+                               const uint64_t *feat_ids,
+                               const int *dims,
+                               const float *const *embeddings, int n);
+
+/* Drain up to max_drain pending responses (0 = drain all).
+ * Returns number of errors, or -1 on connection failure. */
+int graveldb_client_await(GravelDBClient *client, int max_drain);
+
+/* Number of pending (un-drained) async responses */
+int graveldb_client_pending(GravelDBClient *client);
+
 /* Delete features */
 int graveldb_client_delete(GravelDBClient *client,
                            const uint64_t *feat_ids, int n);
