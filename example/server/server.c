@@ -156,6 +156,39 @@ typedef struct SendChunk {
     uint8_t  inline_buf[SEND_CHUNK_INLINE];
 } SendChunk;
 
+/*
+ * Per-connection async IO state machine.
+ *
+ * When a request requires disk IO (pull/pull_stream), we submit the
+ * io_uring reads and return control to the event loop instead of blocking.
+ * On each event loop iteration, we poll all connections with in-flight IO.
+ * Once IO completes, we resume building the response from where we left off.
+ *
+ * States:
+ *   CONN_IDLE        - no request in progress, ready to receive
+ *   CONN_ASYNC_PULL  - pull request with in-flight disk IO
+ *   CONN_ASYNC_STREAM - streaming pull with in-flight disk IO
+ */
+typedef enum {
+    CONN_IDLE = 0,
+    CONN_ASYNC_PULL,
+    CONN_ASYNC_STREAM,
+} ConnAsyncState;
+
+typedef struct {
+    ConnAsyncState  state;
+    GravelDBAsyncGet ag;       /* current in-flight async get */
+    uint64_t   *feat_ids;      /* parsed feat_ids (in arena) */
+    uint32_t    count;         /* total feature count */
+    uint32_t    offset;        /* current chunk offset into feat_ids */
+    float      *chunk_scratch; /* reusable chunk buffer (in arena) */
+    float     **chunk_bufs;    /* per-entry buffer pointers (in arena) */
+    int        *chunk_dims;    /* per-entry dim output (in arena) */
+    uint32_t    chunk_n;       /* entries in current chunk */
+    int         first_frame;   /* streaming: is this the first frame? */
+    int         phase;         /* 0=submit, 1=poll/waiting */
+} ConnAsyncCtx;
+
 typedef struct {
     int       fd;
     uint8_t  *recv_buf;
@@ -166,6 +199,7 @@ typedef struct {
     SendChunk *send_cur;     /* chunk currently being built by response_* */
     size_t     resp_hdr_off; /* offset of response header within send_cur */
     ReqArena  arena;         /* per-request arena; lifetime extended until flush completes */
+    ConnAsyncCtx async;      /* async IO state machine */
 } ClientConn;
 
 /* ===== Read Worker (readonly mode multi-threaded reads) =====
@@ -206,6 +240,10 @@ struct GravelServer {
 
     IOPoller      *poller;
     pthread_t      server_thread;
+
+    /* Async flush state: submitted immediately when flush_needed fires */
+    GravelDBAsyncFlush async_flush;
+    bool               flush_in_flight;
 
     /* Readonly mode: worker threads for lock-free concurrent reads */
     int            num_read_workers;
@@ -263,10 +301,17 @@ static void client_init(ClientConn *c, int fd) {
     c->send_cur  = NULL;
     c->resp_hdr_off = 0;
     arena_init(&c->arena);
+    memset(&c->async, 0, sizeof(c->async));
+    c->async.state = CONN_IDLE;
 }
 
 static void client_close(ClientConn *c) {
     if (c->fd >= 0) close(c->fd);
+    /* If async IO was in flight, drain it to free internal heap state */
+    if (c->async.state != CONN_IDLE && c->async.ag.internal != NULL) {
+        while (graveldb_batch_get_poll(&c->async.ag) == GRAVELDB_AGAIN) {}
+    }
+    c->async.state = CONN_IDLE;
     free(c->recv_buf);
     /* All SendChunks and their grown buffers live in the arena */
     arena_destroy(&c->arena);
@@ -399,6 +444,84 @@ static void response_finish(ClientConn *c) {
     c->send_cur = NULL;
 }
 
+#define PULL_CHUNK_SIZE 64
+#define PULL_MAX_DIM   1024
+
+/*
+ * Submit the next chunk of async IO for a pull request.
+ * If all chunks are done, finalize the response and transition to CONN_IDLE.
+ * Returns: 1 = IO submitted (connection is in async state)
+ *          0 = all done (back to IDLE)
+ */
+static int pull_submit_next_chunk(GravelServer *srv, ClientConn *c) {
+    ConnAsyncCtx *a = &c->async;
+
+    if (a->offset >= a->count) {
+        /* All chunks processed — finalize response */
+        response_finish(c);
+        a->state = CONN_IDLE;
+        return 0;
+    }
+
+    uint32_t chunk_n = a->count - a->offset;
+    if (chunk_n > PULL_CHUNK_SIZE) chunk_n = PULL_CHUNK_SIZE;
+    a->chunk_n = chunk_n;
+
+    for (uint32_t i = 0; i < chunk_n; i++) {
+        a->chunk_dims[i] = 0;
+    }
+
+    GravelDBCtx ctx = make_arena_ctx(&c->arena);
+    graveldb_batch_get_submit(srv->db, &ctx, a->feat_ids + a->offset,
+                              (int)chunk_n, a->chunk_bufs, a->chunk_dims, &a->ag);
+
+    /* Check if it completed immediately (all in memory) */
+    if (graveldb_batch_get_poll(&a->ag) != GRAVELDB_AGAIN) {
+        /* Append results, advance to next chunk */
+        for (uint32_t i = 0; i < chunk_n; i++) {
+            uint32_t d = (uint32_t)a->chunk_dims[i];
+            response_append(c, &d, 4);
+            if (d > 0) {
+                response_append(c, a->chunk_bufs[i], d * sizeof(float));
+            }
+        }
+        a->offset += chunk_n;
+        /* Recurse to submit next (tail call) */
+        return pull_submit_next_chunk(srv, c);
+    }
+
+    /* IO in flight — return to event loop */
+    a->phase = 1;
+    return 1;
+}
+
+/*
+ * Resume an in-progress pull after async IO completes.
+ * Returns: 1 = still in async state (more IO submitted)
+ *          0 = all done (CONN_IDLE)
+ */
+static int pull_resume(GravelServer *srv, ClientConn *c) {
+    ConnAsyncCtx *a = &c->async;
+
+    /* Poll current in-flight IO */
+    if (graveldb_batch_get_poll(&a->ag) == GRAVELDB_AGAIN) {
+        return 1;  /* still waiting */
+    }
+
+    /* IO done — scatter results into response */
+    for (uint32_t i = 0; i < a->chunk_n; i++) {
+        uint32_t d = (uint32_t)a->chunk_dims[i];
+        response_append(c, &d, 4);
+        if (d > 0) {
+            response_append(c, a->chunk_bufs[i], d * sizeof(float));
+        }
+    }
+    a->offset += a->chunk_n;
+
+    /* Submit next chunk or finalize */
+    return pull_submit_next_chunk(srv, c);
+}
+
 static void handle_pull(GravelServer *srv, ClientConn *c, const uint8_t *body, uint32_t body_len) {
     if (body_len < 4) {
         response_begin(c, GRAVELDB_WIRE_INVALID);
@@ -415,9 +538,7 @@ static void handle_pull(GravelServer *srv, ClientConn *c, const uint8_t *body, u
         return;
     }
 
-    GravelDBCtx ctx = make_arena_ctx(&c->arena);
-
-    /* Parse all feat_ids upfront (8 bytes each, contiguous in wire) */
+    /* Parse all feat_ids upfront */
     const uint8_t *ptr = body + 4;
     uint64_t *feat_ids = (uint64_t *)arena_alloc(&c->arena, count * sizeof(uint64_t));
     if (!feat_ids) {
@@ -430,18 +551,7 @@ static void handle_pull(GravelServer *srv, ClientConn *c, const uint8_t *body, u
         ptr += 8;
     }
 
-    response_begin(c, GRAVELDB_WIRE_OK);
-    response_append(c, &count, 4);
-
-    /*
-     * Process in chunks to keep scratch memory bounded (~256KB per chunk).
-     * This preserves batch_get's cache-friendly probe loop while avoiding
-     * arena over-allocation for very large batches.
-     */
-    #define PULL_CHUNK_SIZE 64
-    #define PULL_MAX_DIM   1024
-
-    /* Allocate fixed-size scratch for one chunk — reused across chunks */
+    /* Allocate scratch buffers (reused across chunks) */
     float  *chunk_scratch = (float *)arena_alloc(&c->arena, (size_t)PULL_CHUNK_SIZE * PULL_MAX_DIM * sizeof(float));
     float **chunk_bufs    = (float **)arena_alloc(&c->arena, PULL_CHUNK_SIZE * sizeof(float *));
     int    *chunk_dims    = (int *)arena_alloc(&c->arena, PULL_CHUNK_SIZE * sizeof(int));
@@ -456,30 +566,22 @@ static void handle_pull(GravelServer *srv, ClientConn *c, const uint8_t *body, u
         chunk_bufs[i] = chunk_scratch + (size_t)i * PULL_MAX_DIM;
     }
 
-    for (uint32_t off = 0; off < count; off += PULL_CHUNK_SIZE) {
-        uint32_t chunk_n = count - off;
-        if (chunk_n > PULL_CHUNK_SIZE) chunk_n = PULL_CHUNK_SIZE;
+    /* Begin response and set up async state */
+    response_begin(c, GRAVELDB_WIRE_OK);
+    response_append(c, &count, 4);
 
-        /* Reset dims for this chunk */
-        for (uint32_t i = 0; i < chunk_n; i++) {
-            chunk_dims[i] = 0;
-        }
+    ConnAsyncCtx *a = &c->async;
+    a->state = CONN_ASYNC_PULL;
+    a->feat_ids = feat_ids;
+    a->count = count;
+    a->offset = 0;
+    a->chunk_scratch = chunk_scratch;
+    a->chunk_bufs = chunk_bufs;
+    a->chunk_dims = chunk_dims;
+    a->phase = 0;
 
-        graveldb_batch_get(srv->db, &ctx, feat_ids + off, (int)chunk_n, chunk_bufs, chunk_dims);
-
-        for (uint32_t i = 0; i < chunk_n; i++) {
-            uint32_t d = (uint32_t)chunk_dims[i];
-            response_append(c, &d, 4);
-            if (d > 0) {
-                response_append(c, chunk_bufs[i], d * sizeof(float));
-            }
-        }
-    }
-
-    #undef PULL_CHUNK_SIZE
-    #undef PULL_MAX_DIM
-
-    response_finish(c);
+    /* Submit first chunk — may complete synchronously */
+    pull_submit_next_chunk(srv, c);
 }
 
 /*
@@ -493,7 +595,125 @@ static void handle_pull(GravelServer *srv, ClientConn *c, const uint8_t *body, u
  *   Terminator: [4B 0]
  *
  * Entry: [4B dim][dim*4B floats]
+ *
+ * Async state machine: submit one chunk's IO, return to event loop.
+ * On resume, build frame from completed IO and submit next chunk.
  */
+
+static void stream_send_terminator(ClientConn *c) {
+    SendChunk *term = chunk_arena_new(c);
+    if (term) {
+        uint32_t zero = 0;
+        memcpy(term->data, &zero, 4);
+        term->len = 4;
+        term->next = NULL;
+        if (c->send_tail) c->send_tail->next = term;
+        else c->send_head = term;
+        c->send_tail = term;
+    }
+}
+
+static void stream_build_frame(ClientConn *c) {
+    ConnAsyncCtx *a = &c->async;
+    uint32_t chunk_n = a->chunk_n;
+
+    size_t payload_size = a->first_frame ? 4 : 0;
+    for (uint32_t i = 0; i < chunk_n; i++) {
+        payload_size += 4 + (size_t)a->chunk_dims[i] * sizeof(float);
+    }
+
+    size_t frame_size = 4 + payload_size;
+    SendChunk *ch = chunk_arena_new(c);
+    if (!ch) return;
+
+    if (frame_size > ch->cap) {
+        uint8_t *new_buf = (uint8_t *)arena_alloc(&c->arena, frame_size);
+        if (!new_buf) return;
+        ch->data = new_buf;
+        ch->cap = frame_size;
+    }
+
+    uint8_t *wp = ch->data;
+    uint32_t frame_len = (uint32_t)payload_size;
+    memcpy(wp, &frame_len, 4); wp += 4;
+
+    if (a->first_frame) {
+        memcpy(wp, &a->count, 4); wp += 4;
+        a->first_frame = 0;
+    }
+
+    for (uint32_t i = 0; i < chunk_n; i++) {
+        uint32_t d = (uint32_t)a->chunk_dims[i];
+        memcpy(wp, &d, 4); wp += 4;
+        if (d > 0) {
+            memcpy(wp, a->chunk_bufs[i], d * sizeof(float));
+            wp += d * sizeof(float);
+        }
+    }
+    ch->len = (size_t)(wp - ch->data);
+
+    ch->next = NULL;
+    if (c->send_tail) {
+        c->send_tail->next = ch;
+    } else {
+        c->send_head = ch;
+    }
+    c->send_tail = ch;
+}
+
+/*
+ * Submit next chunk IO for streaming pull.
+ * Returns: 1 = IO in flight, 0 = done (IDLE)
+ */
+static int stream_submit_next_chunk(GravelServer *srv, ClientConn *c) {
+    ConnAsyncCtx *a = &c->async;
+
+    if (a->offset >= a->count) {
+        stream_send_terminator(c);
+        a->state = CONN_IDLE;
+        return 0;
+    }
+
+    uint32_t chunk_n = a->count - a->offset;
+    if (chunk_n > PULL_CHUNK_SIZE) chunk_n = PULL_CHUNK_SIZE;
+    a->chunk_n = chunk_n;
+
+    for (uint32_t i = 0; i < chunk_n; i++) {
+        a->chunk_dims[i] = 0;
+    }
+
+    GravelDBCtx ctx = make_arena_ctx(&c->arena);
+    graveldb_batch_get_submit(srv->db, &ctx, a->feat_ids + a->offset,
+                              (int)chunk_n, a->chunk_bufs, a->chunk_dims, &a->ag);
+
+    if (graveldb_batch_get_poll(&a->ag) != GRAVELDB_AGAIN) {
+        /* Completed immediately */
+        stream_build_frame(c);
+        a->offset += chunk_n;
+        return stream_submit_next_chunk(srv, c);
+    }
+
+    a->phase = 1;
+    return 1;
+}
+
+/*
+ * Resume streaming pull after IO completes.
+ * Returns: 1 = still async, 0 = done
+ */
+static int stream_resume(GravelServer *srv, ClientConn *c) {
+    ConnAsyncCtx *a = &c->async;
+
+    if (graveldb_batch_get_poll(&a->ag) == GRAVELDB_AGAIN) {
+        return 1;  /* still waiting */
+    }
+
+    stream_build_frame(c);
+    a->offset += a->chunk_n;
+
+    return stream_submit_next_chunk(srv, c);
+}
+
 static void handle_pull_stream(GravelServer *srv, ClientConn *c, const uint8_t *body, uint32_t body_len) {
     if (body_len < 4) {
         response_begin(c, GRAVELDB_WIRE_INVALID);
@@ -509,8 +729,6 @@ static void handle_pull_stream(GravelServer *srv, ClientConn *c, const uint8_t *
         response_finish(c);
         return;
     }
-
-    GravelDBCtx ctx = make_arena_ctx(&c->arena);
 
     /* Parse all feat_ids */
     const uint8_t *ptr = body + 4;
@@ -545,112 +763,34 @@ static void handle_pull_stream(GravelServer *srv, ClientConn *c, const uint8_t *
         c->send_tail = ch;
     }
 
-    #define STREAM_CHUNK_SIZE 64
-    #define STREAM_MAX_DIM   1024
-
-    float  *chunk_scratch = (float *)arena_alloc(&c->arena, (size_t)STREAM_CHUNK_SIZE * STREAM_MAX_DIM * sizeof(float));
-    float **chunk_bufs    = (float **)arena_alloc(&c->arena, STREAM_CHUNK_SIZE * sizeof(float *));
-    int    *chunk_dims    = (int *)arena_alloc(&c->arena, STREAM_CHUNK_SIZE * sizeof(int));
+    /* Allocate scratch buffers */
+    float  *chunk_scratch = (float *)arena_alloc(&c->arena, (size_t)PULL_CHUNK_SIZE * PULL_MAX_DIM * sizeof(float));
+    float **chunk_bufs    = (float **)arena_alloc(&c->arena, PULL_CHUNK_SIZE * sizeof(float *));
+    int    *chunk_dims    = (int *)arena_alloc(&c->arena, PULL_CHUNK_SIZE * sizeof(int));
 
     if (!chunk_scratch || !chunk_bufs || !chunk_dims) {
-        /* Already sent header, send a zero-length terminator to close stream */
-        SendChunk *term = chunk_arena_new(c);
-        if (term) {
-            uint32_t zero = 0;
-            memcpy(term->data, &zero, 4);
-            term->len = 4;
-            term->next = NULL;
-            if (c->send_tail) c->send_tail->next = term;
-            else c->send_head = term;
-            c->send_tail = term;
-        }
+        stream_send_terminator(c);
         return;
     }
 
-    for (uint32_t i = 0; i < STREAM_CHUNK_SIZE; i++) {
-        chunk_bufs[i] = chunk_scratch + (size_t)i * STREAM_MAX_DIM;
+    for (uint32_t i = 0; i < PULL_CHUNK_SIZE; i++) {
+        chunk_bufs[i] = chunk_scratch + (size_t)i * PULL_MAX_DIM;
     }
 
-    int first_frame = 1;
-    for (uint32_t off = 0; off < count; off += STREAM_CHUNK_SIZE) {
-        uint32_t chunk_n = count - off;
-        if (chunk_n > STREAM_CHUNK_SIZE) chunk_n = STREAM_CHUNK_SIZE;
+    /* Set up async state */
+    ConnAsyncCtx *a = &c->async;
+    a->state = CONN_ASYNC_STREAM;
+    a->feat_ids = feat_ids;
+    a->count = count;
+    a->offset = 0;
+    a->chunk_scratch = chunk_scratch;
+    a->chunk_bufs = chunk_bufs;
+    a->chunk_dims = chunk_dims;
+    a->first_frame = 1;
+    a->phase = 0;
 
-        for (uint32_t i = 0; i < chunk_n; i++) {
-            chunk_dims[i] = 0;
-        }
-
-        graveldb_batch_get(srv->db, &ctx, feat_ids + off, (int)chunk_n, chunk_bufs, chunk_dims);
-
-        /* Build frame: [4B frame_len][payload...]
-         * First frame payload starts with [4B total_count] */
-        size_t payload_size = first_frame ? 4 : 0;
-        for (uint32_t i = 0; i < chunk_n; i++) {
-            payload_size += 4 + (size_t)chunk_dims[i] * sizeof(float);
-        }
-
-        size_t frame_size = 4 + payload_size; /* 4B frame_len prefix + payload */
-        SendChunk *ch = chunk_arena_new(c);
-        if (!ch) break;
-
-        /* Ensure chunk capacity */
-        if (frame_size > ch->cap) {
-            size_t new_cap = frame_size;
-            uint8_t *new_buf = (uint8_t *)arena_alloc(&c->arena, new_cap);
-            if (!new_buf) break;
-            ch->data = new_buf;
-            ch->cap = new_cap;
-        }
-
-        uint8_t *wp = ch->data;
-        uint32_t frame_len = (uint32_t)payload_size;
-        memcpy(wp, &frame_len, 4); wp += 4;
-
-        if (first_frame) {
-            memcpy(wp, &count, 4); wp += 4;
-            first_frame = 0;
-        }
-
-        for (uint32_t i = 0; i < chunk_n; i++) {
-            uint32_t d = (uint32_t)chunk_dims[i];
-            memcpy(wp, &d, 4); wp += 4;
-            if (d > 0) {
-                memcpy(wp, chunk_bufs[i], d * sizeof(float));
-                wp += d * sizeof(float);
-            }
-        }
-        ch->len = (size_t)(wp - ch->data);
-
-        /* Enqueue and try to flush immediately */
-        ch->next = NULL;
-        if (c->send_tail) {
-            c->send_tail->next = ch;
-        } else {
-            c->send_head = ch;
-        }
-        c->send_tail = ch;
-
-        /* Opportunistic flush: push data into TCP socket buffer early.
-         * Use raw version to avoid arena_reset (we still need feat_ids + scratch). */
-        client_flush_send_raw(c);
-    }
-
-    /* Send terminator frame: frame_len = 0 */
-    {
-        SendChunk *term = chunk_arena_new(c);
-        if (term) {
-            uint32_t zero = 0;
-            memcpy(term->data, &zero, 4);
-            term->len = 4;
-            term->next = NULL;
-            if (c->send_tail) c->send_tail->next = term;
-            else c->send_head = term;
-            c->send_tail = term;
-        }
-    }
-
-    #undef STREAM_CHUNK_SIZE
-    #undef STREAM_MAX_DIM
+    /* Submit first chunk */
+    stream_submit_next_chunk(srv, c);
 }
 
 static void handle_push(GravelServer *srv, ClientConn *c, const uint8_t *body, uint32_t body_len) {
@@ -705,6 +845,12 @@ static void handle_push(GravelServer *srv, ClientConn *c, const uint8_t *body, u
 
     if (actual > 0) {
         graveldb_batch_put(srv->db, &ctx, feat_ids, dims, embeddings, (int)actual);
+
+        /* If water-level hit, submit flush NOW — don't wait for next tick */
+        if (!srv->flush_in_flight && graveldb_flush_needed(srv->db)) {
+            graveldb_flush_submit(srv->db, &srv->async_flush);
+            srv->flush_in_flight = true;
+        }
     }
 
     response_begin(c, GRAVELDB_WIRE_OK);
@@ -722,11 +868,22 @@ static void handle_delete(GravelServer *srv, ClientConn *c, const uint8_t *body,
     memcpy(&count, body, 4);
     const uint8_t *ptr = body + 4;
 
+    /* Parse feat_ids into contiguous array for batch delete */
+    uint64_t stack_ids[64];
+    uint64_t *feat_ids = (count <= 64) ? stack_ids : (uint64_t *)malloc(count * sizeof(uint64_t));
+    if (!feat_ids) { response_begin(c, GRAVELDB_WIRE_ERR); response_finish(c); return; }
+
+    uint32_t actual = 0;
     for (uint32_t i = 0; i < count && ptr + 8 <= body + body_len; i++) {
-        uint64_t feat_id;
-        memcpy(&feat_id, ptr, 8); ptr += 8;
-        graveldb_delete(srv->db, NULL, feat_id);
+        memcpy(&feat_ids[actual], ptr, 8); ptr += 8;
+        actual++;
     }
+
+    if (actual > 0) {
+        graveldb_batch_delete(srv->db, NULL, feat_ids, (int)actual);
+    }
+
+    if (feat_ids != stack_ids) free(feat_ids);
 
     response_begin(c, GRAVELDB_WIRE_OK);
     response_finish(c);
@@ -761,7 +918,32 @@ static void handle_ping(GravelServer *srv, ClientConn *c) {
     response_finish(c);
 }
 
+/*
+ * Resume in-progress async IO on a connection.
+ * Called from the event loop on every iteration for connections with
+ * in-flight disk IO. This is the key mechanism that interleaves disk IO
+ * with network IO across multiple connections.
+ *
+ * Returns:
+ *   1 = still in async state (IO pending)
+ *   0 = completed, connection is IDLE
+ */
+static int client_async_resume(GravelServer *srv, ClientConn *c) {
+    switch (c->async.state) {
+    case CONN_IDLE:
+        return 0;
+    case CONN_ASYNC_PULL:
+        return pull_resume(srv, c);
+    case CONN_ASYNC_STREAM:
+        return stream_resume(srv, c);
+    }
+    return 0;
+}
+
 static int process_message(GravelServer *srv, ClientConn *c) {
+    /* Don't accept new messages while async IO is in progress */
+    if (c->async.state != CONN_IDLE) return 0;
+
     if (c->recv_len < GRAVELDB_WIRE_HEADER_SIZE) return 0;
 
     uint32_t magic, msg_type, body_len;
@@ -822,7 +1004,77 @@ static void *server_loop(void *arg) {
     IOEvent events[MAX_CLIENTS + 1];
 
     while (srv->running) {
-        int n = io_poller_wait(srv->poller, events, MAX_CLIENTS + 1, 100);
+        /*
+         * Phase 0a: Poll in-flight async flush.
+         * This runs the IO completion check — on Linux io_uring CQE,
+         * on macOS it already completed in submit (fdatasync inline).
+         */
+        if (srv->flush_in_flight) {
+            if (graveldb_flush_poll(&srv->async_flush) != GRAVELDB_AGAIN) {
+                srv->flush_in_flight = false;
+            }
+        }
+
+        /*
+         * Phase 0b: Resume all connections with in-flight disk IO.
+         * This is what makes disk IO and network IO truly interleaved:
+         * after submitting disk IO for one client, we come back here on the
+         * next iteration and can service other clients' network IO in between.
+         */
+        int has_async = 0;
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            ClientConn *c = &srv->clients[i];
+            if (c->fd < 0 || c->async.state == CONN_IDLE) continue;
+
+            has_async = 1;
+            int still_busy = client_async_resume(srv, c);
+
+            /* If async completed, try to flush + process queued messages */
+            if (!still_busy) {
+                if (client_has_pending_send(c)) {
+                    int wr_rc = client_flush_send(c);
+                    if (wr_rc < 0) {
+                        io_poller_del(srv->poller, c->fd);
+                        client_close(c);
+                        srv->num_clients--;
+                        continue;
+                    }
+                }
+                /* Process any queued messages that were blocked */
+                int rc;
+                while ((rc = process_message(srv, c)) > 0) {}
+                if (rc < 0) {
+                    io_poller_del(srv->poller, c->fd);
+                    client_close(c);
+                    srv->num_clients--;
+                    continue;
+                }
+            } else {
+                /* Still busy with disk IO — flush network in the meantime */
+                if (client_has_pending_send(c)) {
+                    int wr_rc = client_flush_send_raw(c);
+                    if (wr_rc < 0) {
+                        io_poller_del(srv->poller, c->fd);
+                        client_close(c);
+                        srv->num_clients--;
+                        continue;
+                    }
+                }
+            }
+
+            if (c->fd >= 0) {
+                uint32_t interest = IO_EVENT_READ;
+                if (client_has_pending_send(c)) {
+                    interest |= IO_EVENT_WRITE;
+                }
+                io_poller_mod(srv->poller, c->fd, interest, c);
+            }
+        }
+
+        /* Use zero timeout if any connection has async IO in flight,
+         * or if a flush is in progress — don't block while IO is completing. */
+        int timeout_ms = (has_async || srv->flush_in_flight) ? 0 : 100;
+        int n = io_poller_wait(srv->poller, events, MAX_CLIENTS + 1, timeout_ms);
 
         if (!srv->readonly && srv->checkpoint_interval_ms > 0) {
             uint64_t now = now_ms();
@@ -952,7 +1204,56 @@ static void *read_worker_loop(void *arg) {
     fake_srv->readonly = true;
 
     while (*w->running) {
-        int n = io_poller_wait(w->poller, events, WORKER_MAX_CLIENTS + 1, 100);
+        /* Phase 0: Resume async IO on all worker clients */
+        int has_async = 0;
+        for (int i = 0; i < WORKER_MAX_CLIENTS; i++) {
+            ClientConn *c = &w->clients[i];
+            if (c->fd < 0 || c->async.state == CONN_IDLE) continue;
+
+            has_async = 1;
+            int still_busy = client_async_resume(fake_srv, c);
+
+            if (!still_busy) {
+                if (client_has_pending_send(c)) {
+                    int wr_rc = client_flush_send(c);
+                    if (wr_rc < 0) {
+                        io_poller_del(w->poller, c->fd);
+                        client_close(c);
+                        w->num_clients--;
+                        continue;
+                    }
+                }
+                int rc;
+                while ((rc = process_message(fake_srv, c)) > 0) {}
+                if (rc < 0) {
+                    io_poller_del(w->poller, c->fd);
+                    client_close(c);
+                    w->num_clients--;
+                    continue;
+                }
+            } else {
+                if (client_has_pending_send(c)) {
+                    int wr_rc = client_flush_send_raw(c);
+                    if (wr_rc < 0) {
+                        io_poller_del(w->poller, c->fd);
+                        client_close(c);
+                        w->num_clients--;
+                        continue;
+                    }
+                }
+            }
+
+            if (c->fd >= 0) {
+                uint32_t interest = IO_EVENT_READ;
+                if (client_has_pending_send(c)) {
+                    interest |= IO_EVENT_WRITE;
+                }
+                io_poller_mod(w->poller, c->fd, interest, c);
+            }
+        }
+
+        int timeout_ms = has_async ? 0 : 100;
+        int n = io_poller_wait(w->poller, events, WORKER_MAX_CLIENTS + 1, timeout_ms);
         if (n <= 0) continue;
 
         for (int i = 0; i < n; i++) {
@@ -1094,6 +1395,7 @@ graveldb_status_t gravel_server_create(GravelServer **out, const GravelServerCon
     srv->listen_fd = -1;
     srv->running = 0;
     srv->readonly = config->readonly;
+    srv->flush_in_flight = false;
     srv->num_read_workers = 0;
     srv->workers = NULL;
     srv->worker_pipe_w = NULL;
