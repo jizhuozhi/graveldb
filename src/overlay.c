@@ -140,6 +140,7 @@ graveldb_status_t overlay_init(OverlayBuffer *ob, int dim) {
     }
 
     ob->memory_used = 0;
+    ob->budget_bytes = 0;  /* unlimited until caller sets it */
 
     /* Create a dedicated slab pool for this overlay's embedding data.
      * All entries have the same size: dim * sizeof(float).

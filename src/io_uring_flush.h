@@ -16,6 +16,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,16 +42,16 @@ extern "C" {
  */
 
 typedef struct {
-    uint32_t    pending;
-    uint32_t    errors;
-    bool        initialized;
+    uint32_t  pending;
+    uint32_t  errors;
+    bool      initialized;
 
     /* Track distinct fds that received writes (for per-fd fsync) */
-    int         fsync_fds[URING_MAX_FDS];
-    int         fsync_fd_count;
+    int       fsync_fds[URING_MAX_FDS];
+    int       fsync_fd_count;
 
 #if GRAVELDB_USE_IO_URING
-    void       *ring;   /* struct io_uring* (opaque) */
+    void     *ring;   /* struct io_uring* (opaque) */
 #endif
 } uring_io_ctx_t;
 
@@ -66,6 +67,14 @@ int uring_io_init(uring_io_ctx_t *ctx);
  */
 int uring_io_submit_write(uring_io_ctx_t *ctx, int fd,
                           const void *buf, size_t len, off_t offset);
+
+/*
+ * Submit a vectored write (writev) for a specific fd.
+ * All iov entries must remain valid until uring_io_wait().
+ * Merges multiple buffers into a single kernel I/O operation.
+ */
+int uring_io_submit_writev(uring_io_ctx_t *ctx, int fd,
+                           const struct iovec *iov, int iovcnt, off_t offset);
 
 /*
  * Submit a read request for a specific fd.
@@ -85,6 +94,20 @@ int uring_io_submit_fsyncs(uring_io_ctx_t *ctx);
  * Returns number of errors (0 = all OK).
  */
 int uring_io_wait(uring_io_ctx_t *ctx);
+
+/*
+ * Non-blocking poll: reap any completed I/O without waiting.
+ * Returns the number of still-pending I/O requests (0 = all done).
+ * Use this in an event loop to check progress without blocking.
+ */
+int uring_io_poll(uring_io_ctx_t *ctx);
+
+/*
+ * Reset the I/O context for reuse (clear pending/errors/fsync state).
+ * The underlying ring is preserved -- avoids expensive re-init syscall.
+ * Call this at the start of each flush cycle when reusing a persistent ring.
+ */
+void uring_io_reset(uring_io_ctx_t *ctx);
 
 /*
  * Destroy the I/O context.

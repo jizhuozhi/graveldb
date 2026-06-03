@@ -16,16 +16,26 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <sys/uio.h>
 
-#include "overlay.h"
+#ifdef __linux__
+#include <linux/falloc.h>
+#endif
 
-static inline uint32_t xorshift32(uint32_t *state) {
-    uint32_t x = *state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    *state = x;
-    return x;
+/*
+ * Platform-aware file space pre-allocation.
+ * On Linux: uses fallocate() which allocates disk blocks immediately,
+ * avoiding later block-allocation latency during pwrite.
+ * Elsewhere: falls back to ftruncate (sparse file, blocks allocated on write).
+ */
+static inline int graveldb_preallocate(int fd, size_t new_size) {
+#ifdef __linux__
+    int ret = fallocate(fd, 0, 0, (off_t)new_size);
+    if (ret == 0) return 0;
+    /* EOPNOTSUPP on some filesystems (e.g. tmpfs): fall through to ftruncate */
+    if (errno != EOPNOTSUPP && errno != ENOSYS) return -1;
+#endif
+    return ftruncate(fd, (off_t)new_size);
 }
 
 /*
@@ -57,9 +67,8 @@ static inline size_t align_up(size_t val, size_t align) {
 }
 
 /* Forward declarations */
-graveldb_status_t dimbin_flush(DimBin *s);
+graveldb_status_t dimbin_flush(DimBin *s, bool sync);
 static inline bool dimbin_should_flush(DimBin *s);
-static void dimbin_proactive_flush(DimBin *s);
 static uint8_t *write_buf_ensure_page(DimBin *s, uint32_t page_id);
 
 graveldb_status_t dimbin_init(DimBin *s, int dim, const char *file_path,
@@ -100,15 +109,6 @@ graveldb_status_t dimbin_init(DimBin *s, int dim, const char *file_path,
     if (fstat(s->fd, &st) < 0) { rc = GRAVELDB_ERR_IO; goto fail; }
     s->data_file_size = (size_t)st.st_size;
 
-    if (st.st_size > 0) {
-        s->bump_ptr = st.st_size / s->entry_size;
-        s->total_entries = st.st_size / s->entry_size;
-    } else {
-        s->bump_ptr = 0;
-        s->total_entries = 0;
-    }
-    s->total_pages = (s->total_entries + s->entries_per_page - 1) / s->entries_per_page;
-
     /* Track key file size */
     struct stat kst;
     if (fstat(s->key_fd, &kst) == 0) {
@@ -116,6 +116,18 @@ graveldb_status_t dimbin_init(DimBin *s, int dim, const char *file_path,
     } else {
         s->key_file_size = 0;
     }
+
+    /* Derive bump_ptr from key file: each slot is one uint64_t.
+     * The key file is the authoritative source for slot count because
+     * the data file may have been pre-extended (ftruncate for growth)
+     * and its size doesn't reflect actual allocation count. */
+    uint64_t key_slots = s->key_file_size / sizeof(uint64_t);
+    uint64_t data_slots = (st.st_size > 0) ? (uint64_t)st.st_size / s->entry_size : 0;
+    /* Use the minimum of key-derived and data-derived slot count.
+     * This handles the case where data was pre-extended but keys weren't. */
+    s->bump_ptr = (key_slots < data_slots) ? key_slots : data_slots;
+    s->total_entries = s->bump_ptr;
+    s->total_pages = (s->total_entries + s->entries_per_page - 1) / s->entries_per_page;
 
     s->free_capacity = 1024;
     s->free_list = (uint32_t *)malloc(s->free_capacity * sizeof(uint32_t));
@@ -136,8 +148,6 @@ graveldb_status_t dimbin_init(DimBin *s, int dim, const char *file_path,
     /* Initialize WriteBuffer (hashmap) */
     s->write_buf.max_pages = write_max;
     s->write_buf.count = 0;
-    s->write_buf.write_counter = 0;
-    s->write_buf.rng_state = 67890;  /* deterministic seed */
     uint32_t wb_cap = 64;  /* initial capacity, will grow as needed */
     while (wb_cap < write_max * 2) wb_cap *= 2;
     s->write_buf.capacity = wb_cap;
@@ -151,7 +161,18 @@ graveldb_status_t dimbin_init(DimBin *s, int dim, const char *file_path,
     s->flush_dirty_buf = (uint32_t *)malloc(GRAVELDB_MAX_FLUSH_BATCH * sizeof(uint32_t));
     if (!s->flush_dirty_buf) { rc = GRAVELDB_ERR_OOM; goto fail; }
 
+    /* Initialize KeyBTree with a fixed memory budget.
+     * Budget = write_max pages × entries_per_page × ~40 bytes per entry overhead.
+     * Capped between 256KB and 16MB. */
+    {
+        size_t budget = (size_t)write_max * s->entries_per_page * 40;
+        if (budget < (256u << 10)) budget = (256u << 10);
+        if (budget > (16u << 20)) budget = (16u << 20);
+        kbt_init(&s->key_buf, budget);
+    }
+
     s->in_checkpoint = false;
+    s->flush_needed = false;
 
     return GRAVELDB_OK;
 
@@ -164,6 +185,7 @@ fail:
     dirty_tracker_destroy(&s->dirty);
     free(s->write_buf.slots);
     free(s->flush_dirty_buf);
+    kbt_destroy(&s->key_buf);
     memset(s, 0, sizeof(*s));
     s->fd = -1;
     s->key_fd = -1;
@@ -188,7 +210,14 @@ void dimbin_destroy(DimBin *s) {
         free(s->write_buf.slots);
     }
 
+    /* Free page pool (recycled buffers not currently in use) */
+    for (uint32_t i = 0; i < s->write_buf.pool_count; i++) {
+        slab_free_aligned(s->allocator, s->write_buf.page_pool[i], s->page_size);
+    }
+    free(s->write_buf.page_pool);
+
     free(s->flush_dirty_buf);
+    kbt_destroy(&s->key_buf);
 
     overlay_destroy(&s->overlay);
     memset(s, 0, sizeof(*s));
@@ -205,9 +234,9 @@ void dimbin_reserve(DimBin *s, uint32_t count) {
     if (s->data_file_size < required_bytes) {
         size_t new_size = s->data_file_size > 0 ? s->data_file_size * 2 : (size_t)s->page_size * 256;
         while (new_size < required_bytes) new_size *= 2;
-        if (ftruncate(s->fd, new_size) == 0) {
+        if (graveldb_preallocate(s->fd, new_size) == 0) {
             s->data_file_size = new_size;
-        } else if (ftruncate(s->fd, required_bytes) == 0) {
+        } else if (graveldb_preallocate(s->fd, required_bytes) == 0) {
             s->data_file_size = required_bytes;
         }
     }
@@ -215,7 +244,7 @@ void dimbin_reserve(DimBin *s, uint32_t count) {
     if (s->key_file_size < key_required) {
         size_t new_key_size = s->key_file_size > 0 ? s->key_file_size * 2 : 8192;
         while (new_key_size < key_required) new_key_size *= 2;
-        if (ftruncate(s->key_fd, new_key_size) == 0) {
+        if (graveldb_preallocate(s->key_fd, new_key_size) == 0) {
             s->key_file_size = new_key_size;
         }
     }
@@ -233,9 +262,9 @@ uint32_t dimbin_alloc_entry(DimBin *s) {
     if (__builtin_expect(s->data_file_size < required_bytes, 0)) {
         size_t new_size = s->data_file_size > 0 ? s->data_file_size * 2 : (size_t)s->page_size * 256;
         if (new_size < required_bytes) new_size = required_bytes * 2;
-        if (ftruncate(s->fd, new_size) == 0) {
+        if (graveldb_preallocate(s->fd, new_size) == 0) {
             s->data_file_size = new_size;
-        } else if (ftruncate(s->fd, required_bytes) == 0) {
+        } else if (graveldb_preallocate(s->fd, required_bytes) == 0) {
             s->data_file_size = required_bytes;
         }
     }
@@ -258,16 +287,12 @@ uint32_t dimbin_alloc_entry(DimBin *s) {
 }
 
 /*
- * Key write: immediate pwrite to key file.
- * No buffering -- ensures crash consistency for add/remove operations.
- * Returns GRAVELDB_OK on success, GRAVELDB_ERR_IO on failure.
- * Caller must NOT proceed with value write if key write fails,
- * otherwise the slot becomes a phantom (occupied but unrecoverable after crash).
+ * Key write: immediate pwrite to key file (no buffering).
  */
 graveldb_status_t dimbin_put_key(DimBin *s, uint32_t entry_idx, uint64_t feat_id) {
     off_t offset = (off_t)entry_idx * sizeof(uint64_t);
-    ssize_t wr = pwrite(s->key_fd, &feat_id, sizeof(uint64_t), offset);
-    if (wr != sizeof(uint64_t)) {
+    ssize_t wr = pwrite(s->key_fd, &feat_id, 8, offset);
+    if (wr != 8) {
         s->io_errors++;
         return GRAVELDB_ERR_IO;
     }
@@ -275,21 +300,46 @@ graveldb_status_t dimbin_put_key(DimBin *s, uint32_t entry_idx, uint64_t feat_id
 }
 
 /*
- * Batched key write with user-space page-level coalescing.
- *
- * Strategy:
- *   - Key file is laid out as uint64_t[entry_idx], i.e. 512 keys per 4KB page.
- *   - We bucket entries by key-page. For each page:
- *     * If density >= threshold (e.g. >=4 keys in same page), do read-modify-write:
- *       pread the whole 4KB page, patch all keys in-memory, pwrite it back.
- *       Cost: 2 syscalls regardless of how many keys land in that page.
- *     * Otherwise (sparse page), issue individual 8-byte pwrite per key.
- *       Cost: 1 syscall per key but avoids reading a full page for 1-3 patches.
- *
- * The threshold balances: 1 pread + 1 pwrite (2 syscalls for any density)
- * vs N individual pwrites (N syscalls). Break-even is N=2, but accounting for
- * the larger transfer size of a full-page read we use threshold=4 to also
- * amortize cache-line / SSD write-amplification effects.
+ * Buffer a key write in the B-tree (sorted + dedup).
+ * When arena is nearly full, trigger a flush before inserting.
+ */
+void dimbin_buf_key(DimBin *s, uint32_t entry_idx, uint64_t feat_id) {
+    KeyBTree *kb = &s->key_buf;
+
+    /* Arena nearly full: flush before inserting */
+    if (kbt_full(kb)) {
+        dimbin_flush_keys(s);
+    }
+
+    kbt_insert(kb, entry_idx, feat_id);
+}
+
+/*
+ * Flush buffered keys to disk with batched coalescing.
+ * fdatasync is deferred to the caller (only needed at checkpoint/close).
+ */
+graveldb_status_t dimbin_flush_keys(DimBin *s) {
+    KeyBTree *kb = &s->key_buf;
+    if (kb->count == 0) return GRAVELDB_OK;
+
+    /* Collect entries from B-tree in sorted order (no extra sort needed) */
+    KeyWriteEntry *batch = (KeyWriteEntry *)malloc(kb->count * sizeof(KeyWriteEntry));
+    if (!batch) return GRAVELDB_ERR_OOM;
+
+    uint32_t n = kbt_collect(kb, batch);
+
+    /* Batch write with page coalescing (entries already sorted by entry_idx) */
+    dimbin_put_keys_batch(s, batch, (int)n);
+    free(batch);
+
+    kbt_clear(kb);
+    return GRAVELDB_OK;
+}
+
+/*
+ * Batched key write with page-level coalescing.
+ * Dense pages (>=KEY_COALESCE_THRESH keys): read-modify-write full 4KB page.
+ * Sparse pages: individual 8-byte pwrite per key.
  */
 
 #define KEY_PAGE_SIZE       4096
@@ -312,18 +362,20 @@ static inline void flush_key_page(DimBin *s, uint8_t *page_buf,
         } else {
             memset(page_buf, 0, KEY_PAGE_SIZE);
         }
+        /* Data files are native byte order — patch directly */
         uint64_t *kp = (uint64_t *)page_buf;
         for (int k = 0; k < count; k++) {
             kp[slots[k]] = vals[k];
         }
+        /* Write back native format directly */
         if (pwrite(s->key_fd, page_buf, KEY_PAGE_SIZE, pg_off) != KEY_PAGE_SIZE) {
             s->io_errors++;
         }
     } else {
-        /* Sparse: individual 8-byte writes */
+        /* Sparse: individual 8-byte writes (native byte order) */
         for (int k = 0; k < count; k++) {
             off_t off = (off_t)(page_id * KEYS_PER_PAGE + slots[k]) * sizeof(uint64_t);
-            if (pwrite(s->key_fd, &vals[k], sizeof(uint64_t), off) != sizeof(uint64_t)) {
+            if (pwrite(s->key_fd, &vals[k], 8, off) != 8) {
                 s->io_errors++;
             }
         }
@@ -385,29 +437,25 @@ void dimbin_free_entry(DimBin *s, uint32_t entry_idx) {
     }
     s->free_list[s->free_count++] = entry_idx;
 
-    /* Best-effort: zero the key. Failure is tolerable because the slot is on
-     * free_list and will get a new key on next reuse via dimbin_put_key. */
-    (void)dimbin_put_key(s, entry_idx, 0);
+    /* Buffer key=0 write (goes through key buffer so ordering is preserved) */
+    dimbin_buf_key(s, entry_idx, 0);
 }
 
 /*
- * WriteBuffer: ensure a page exists in the write buffer.
- * If the page doesn't exist yet, allocate it and optionally load from disk
- * to support partial-page writes.
- * Returns pointer to page buffer, or NULL on failure.
+ * Ensure a page exists in the write buffer; load from disk if needed.
  */
 static uint8_t *write_buf_ensure_page(DimBin *s, uint32_t page_id) {
     WriteBuffer *wb = &s->write_buf;
 
-    /* Check if already in hashmap */
     uint32_t idx = pagemap_find(wb->slots, wb->capacity, page_id);
     if (wb->slots[idx].page_id == page_id) {
         return wb->slots[idx].data;
     }
 
-    /* Need to insert -- check if we need to flush first */
+    /* Need to insert -- flush if at hard limit */
     if (wb->count >= wb->max_pages) {
-        dimbin_flush(s);
+        dimbin_flush(s, false);
+        idx = pagemap_find(wb->slots, wb->capacity, page_id);
     }
 
     /* Grow hashmap if load factor too high (>70%) */
@@ -417,25 +465,25 @@ static uint8_t *write_buf_ensure_page(DimBin *s, uint32_t page_id) {
         if (!new_slots) return NULL;
         wb->slots = new_slots;
         wb->capacity = new_cap;
-        /* Re-find insertion point after rehash */
         idx = pagemap_find(wb->slots, wb->capacity, page_id);
     }
 
-    /* Allocate page */
-    void *mem = slab_alloc_aligned(s->allocator, s->page_size, 4096);
+    /* Allocate page: prefer recycled buffer from pool */
+    void *mem = write_buf_acquire_page(wb, s->allocator, s->page_size);
     if (!mem) return NULL;
 
-    /* Load existing data from disk for partial-page writes.
-     * Optimization: if the page is beyond current file size (freshly bump-allocated),
-     * skip pread entirely -- just zero-fill. This eliminates syscalls for the common
-     * batch-insert path where all pages are new. */
+    /* Load existing data from disk only if this page contains previously
+     * committed entries. Pages beyond bump_ptr are virgin (even if the file
+     * was preallocated/ftruncated larger), so memset is sufficient. */
+    uint32_t first_committed_page = (uint32_t)(s->bump_ptr / (uint32_t)s->entries_per_page);
     off_t page_offset = (off_t)page_id * s->page_size;
-    if ((size_t)page_offset < s->data_file_size) {
+    if (page_id < first_committed_page && (size_t)page_offset < s->data_file_size) {
         ssize_t rd = pread(s->fd, mem, s->page_size, page_offset);
         if (rd < (ssize_t)s->page_size) {
             if (rd < 0) rd = 0;
             memset((uint8_t *)mem + rd, 0, s->page_size - (size_t)rd);
         }
+        /* Data files are native byte order — no conversion needed */
     } else {
         memset(mem, 0, s->page_size);
     }
@@ -447,97 +495,18 @@ static uint8_t *write_buf_ensure_page(DimBin *s, uint32_t page_id) {
     return (uint8_t *)mem;
 }
 
-graveldb_status_t dimbin_get(DimBin *s, uint32_t entry_id, float *buf) {
-    if (s->in_checkpoint) {
-        if (overlay_contains(&s->overlay, entry_id)) {
-            overlay_get(&s->overlay, entry_id, buf, s->dim);
-            return GRAVELDB_OK;
-        }
-    }
-
-    uint32_t page_id = entry_id / s->entries_per_page;
-    uint32_t offset_in_page = (entry_id % s->entries_per_page) * s->entry_size;
-
-    /* 1. Forwarding: check write buffer first (read-your-writes) */
-    WriteBuffer *wb = &s->write_buf;
-    uint32_t wb_idx = pagemap_find(wb->slots, wb->capacity, page_id);
-    if (wb->slots[wb_idx].page_id == page_id) {
-        memcpy(buf, wb->slots[wb_idx].data + offset_in_page, s->entry_size);
-        return GRAVELDB_OK;
-    }
-
-    /* 2. Direct pread fallback */
-    off_t offset = (off_t)entry_id * s->entry_size;
-    ssize_t rd = pread(s->fd, buf, s->entry_size, offset);
-    if (rd < 0) return GRAVELDB_ERR_IO;
-    return GRAVELDB_OK;
-}
-
-graveldb_status_t dimbin_put(DimBin *s, uint32_t entry_id, const float *data) {
-    if (s->in_checkpoint) {
-        return overlay_put(&s->overlay, entry_id, data, s->dim);
-    }
-
-    uint32_t page_id = entry_id / s->entries_per_page;
-    uint32_t offset_in_page = (entry_id % s->entries_per_page) * s->entry_size;
-
-    if (page_id >= s->dirty.capacity) {
-        uint32_t new_cap = page_id < 1024 ? 1024 : (page_id + 1) * 2;
-        dirty_tracker_resize(&s->dirty, new_cap);
-    }
-
-    /* Write into WriteBuffer */
-    uint8_t *page = write_buf_ensure_page(s, page_id);
-    if (page) {
-        memcpy(page + offset_in_page, data, s->entry_size);
-        dirty_tracker_mark(&s->dirty, page_id);
-
-        /* Water-level check */
-        if (dimbin_should_flush(s)) {
-            dimbin_flush(s);
-        } else {
-            /* Proactive flush: amortize I/O over time */
-            s->write_buf.write_counter++;
-            if (s->write_buf.write_counter >= WB_PROACTIVE_FLUSH_INTERVAL) {
-                s->write_buf.write_counter = 0;
-                dimbin_proactive_flush(s);
-            }
-        }
-        return GRAVELDB_OK;
-    }
-
-    /* Fallback: direct pwrite */
-    off_t offset = (off_t)entry_id * s->entry_size;
-    ssize_t wr = pwrite(s->fd, data, s->entry_size, offset);
-    if (wr < 0) return GRAVELDB_ERR_IO;
-    dirty_tracker_mark(&s->dirty, page_id);
-    return GRAVELDB_OK;
-}
-
 /*
- * Batch embedding write with page-level coalescing.
- *
- * Strategy:
- *   1. Sort entries by page_id -> entries on same page become adjacent
- *   2. For each unique page: call write_buf_ensure_page ONCE
- *   3. memcpy all entries for that page in a tight loop (L1 cache hot)
- *   4. NO water-level check per entry -- defer to END of entire batch
- *   5. Single water-level check + optional flush after all data is buffered
- *
- * This eliminates:
- *   - Redundant pagemap_find probes (one per page instead of per entry)
- *   - Mid-batch flush interruptions that break page locality
- *   - Per-entry branch overhead for flush/proactive-flush logic
- *
- * For typical batch of 1K entries with dim=128 (entry_size=512B, 8 entries/page),
- * this reduces ensure_page calls from 1000 to ~125 and avoids any mid-batch I/O.
+ * Batch embedding write: sort by page, coalesce, defer flush to end.
  */
 graveldb_status_t dimbin_put_batch(DimBin *s, const EmbWriteEntry *entries, int count) {
     if (count <= 0) return GRAVELDB_OK;
 
-    /* Checkpoint redirect: all writes go to overlay */
+    /* During checkpoint: writes go to overlay with backpressure */
     if (s->in_checkpoint) {
         for (int i = 0; i < count; i++) {
+            if (overlay_full(&s->overlay)) {
+                return GRAVELDB_ERR_BUSY;
+            }
             graveldb_status_t rc = overlay_put(&s->overlay, entries[i].entry_id,
                                                entries[i].data, s->dim);
             if (rc != GRAVELDB_OK) return rc;
@@ -545,7 +514,7 @@ graveldb_status_t dimbin_put_batch(DimBin *s, const EmbWriteEntry *entries, int 
         return GRAVELDB_OK;
     }
 
-    /* Build sorted index by page_id for coalescing */
+    /* Sort entries by page_id for coalescing */
     uint32_t stack_order[256];
     uint32_t *order = (count <= 256) ? stack_order :
                       (uint32_t *)malloc((size_t)count * sizeof(uint32_t));
@@ -553,7 +522,7 @@ graveldb_status_t dimbin_put_batch(DimBin *s, const EmbWriteEntry *entries, int 
 
     for (int i = 0; i < count; i++) order[i] = (uint32_t)i;
 
-    /* Sort by page_id (insertion sort -- fast for mostly-sorted bump alloc) */
+    /* Insertion sort (fast for mostly-sorted bump alloc order) */
     uint32_t epp = (uint32_t)s->entries_per_page;
     for (int i = 1; i < count; i++) {
         uint32_t key = order[i];
@@ -595,11 +564,13 @@ graveldb_status_t dimbin_put_batch(DimBin *s, const EmbWriteEntry *entries, int 
             }
             dirty_tracker_mark(&s->dirty, page_id);
         } else {
-            /* Fallback: direct pwrite per entry */
+            /* Fallback: direct pwrite per entry (native byte order) */
+            uint8_t tmp_entry[4096]; /* stack buffer, entry_size <= page_size */
             for (int k = gi; k < gj; k++) {
                 uint32_t eid = entries[order[k]].entry_id;
                 off_t offset = (off_t)eid * (off_t)s->entry_size;
-                ssize_t wr = pwrite(s->fd, entries[order[k]].data, s->entry_size, offset);
+                memcpy(tmp_entry, entries[order[k]].data, s->entry_size);
+                ssize_t wr = pwrite(s->fd, tmp_entry, s->entry_size, offset);
                 if (wr < 0) rc = GRAVELDB_ERR_IO;
                 dirty_tracker_mark(&s->dirty, page_id);
             }
@@ -608,27 +579,17 @@ graveldb_status_t dimbin_put_batch(DimBin *s, const EmbWriteEntry *entries, int 
         gi = gj;
     }
 
-    /* Deferred water-level check: only AFTER entire batch is buffered */
+    /* Deferred water-level check: set flag instead of blocking */
     if (dimbin_should_flush(s)) {
-        dimbin_flush(s);
+        s->flush_needed = true;
     }
 
     if (order != stack_order) free(order);
     return rc;
 }
 
-/*
- * Peephole gap tolerance: allow up to PEEPHOLE_GAP_MAX pages of gap between
- * two dirty runs. If gap <= threshold, merge them into one large sequential
- * write (the gap pages are read from buffer or zeroed). This trades a small
- * amount of extra write bandwidth for dramatically better I/O continuity.
- *
- * Rationale: NVMe optimal I/O size is 64-128KB. A 1-block gap (4KB) costs 4KB
- * extra write but saves one syscall boundary + one queue head re-seek. The
- * amortized benefit is massive when dirty pages are semi-contiguous (which is
- * the common case for bump-pointer allocation).
- */
-#define PEEPHOLE_GAP_MAX   4   /* merge runs separated by up to 4 pages */
+/* Peephole gap: merge dirty runs separated by up to 4 pages */
+#define PEEPHOLE_GAP_MAX   4
 
 /*
  * Water-level threshold: when write buffer dirty count exceeds this fraction
@@ -644,13 +605,19 @@ static int cmp_u32(const void *a, const void *b) {
 }
 
 /*
- * Flush WriteBuffer: collect all pages from hashmap -> sort by page_id
- * -> peephole merge -> pwrite large contiguous runs. After flush, all freed.
- *
- * Keys are no longer buffered (immediate pwrite on put_key), so no key flush.
+ * Flush: keys first, then value pages via io_uring.
+ * When sync=true, fdatasync key_fd and data_fd after writes (checkpoint/close).
+ * When sync=false, only write to page cache (buffer eviction).
  */
-graveldb_status_t dimbin_flush(DimBin *s) {
+graveldb_status_t dimbin_flush(DimBin *s, bool sync) {
     WriteBuffer *wb = &s->write_buf;
+
+    /* Phase 1: Flush buffered keys BEFORE value pages */
+    graveldb_status_t key_rc = dimbin_flush_keys(s);
+    if (key_rc != GRAVELDB_OK) return key_rc;
+
+    /* Clear flush_needed flag since we're flushing now */
+    s->flush_needed = false;
 
     if (wb->count == 0) return GRAVELDB_OK;
 
@@ -669,10 +636,19 @@ graveldb_status_t dimbin_flush(DimBin *s) {
     /* Sort for peephole merge */
     qsort(dirty_pages, n, sizeof(uint32_t), cmp_u32);
 
-    /* Peephole merge + io_uring batch submit */
+    /* Peephole merge + io_uring vectored batch submit */
     uring_io_ctx_t io_ctx;
     int use_uring = (uring_io_init(&io_ctx) == 0);
     graveldb_status_t rc = GRAVELDB_OK;
+
+    /* For io_uring writev: iov arrays must survive until wait completes.
+     * Collect heap-allocated iov pointers for deferred free. */
+    struct iovec **iov_heap_ptrs = NULL;
+    int iov_heap_count = 0;
+    int iov_heap_cap = 0;
+
+    /* Stack iovec buffer for synchronous (fallback) writev calls */
+    struct iovec stack_iov[128];
 
     int i = 0;
     while (i < n) {
@@ -683,49 +659,206 @@ graveldb_status_t dimbin_flush(DimBin *s) {
             j++;
         }
 
-        /* Submit each dirty page in this run */
+        /* Pages are native byte order — write directly to data file */
         for (int k = i; k < j; k++) {
             uint32_t pg = dirty_pages[k];
             uint32_t slot_idx = pagemap_find(wb->slots, wb->capacity, pg);
             if (wb->slots[slot_idx].page_id != pg) continue;
-
-            if (use_uring) {
-                if (uring_io_submit_write(&io_ctx, s->fd,
-                                          wb->slots[slot_idx].data,
-                                          s->page_size,
-                                          (off_t)pg * s->page_size) < 0) {
-                    rc = GRAVELDB_ERR_IO;
-                }
-            } else {
-                ssize_t wr = pwrite(s->fd, wb->slots[slot_idx].data, s->page_size,
-                                    (off_t)pg * s->page_size);
-                if (wr != (ssize_t)s->page_size) rc = GRAVELDB_ERR_IO;
-            }
         }
+
+        /* Build iovec for consecutive pages within this run.
+         * A page is "consecutive" if its page_id == prev_page_id + 1.
+         * Non-consecutive pages (gaps within the peephole run) start a new writev.
+         * Each writev is capped at FLUSH_IOV_MAX to respect UIO_MAXIOV. */
+        #define FLUSH_IOV_MAX 1024
+
+        int ri = i;
+        while (ri < j) {
+            /* Find consecutive sub-run starting at ri */
+            int rj = ri + 1;
+            while (rj < j && dirty_pages[rj] == dirty_pages[rj - 1] + 1) {
+                rj++;
+            }
+
+            /* Submit consecutive sub-run in chunks of FLUSH_IOV_MAX */
+            int sub_pos = ri;
+            while (sub_pos < rj) {
+                int chunk_end = sub_pos + FLUSH_IOV_MAX;
+                if (chunk_end > rj) chunk_end = rj;
+                int chunk_len = chunk_end - sub_pos;
+
+                /* For io_uring writev with iovcnt>1: always heap-alloc iov
+                 * (must survive until uring_io_wait). For fallback: use stack. */
+                struct iovec *iov;
+                int iov_on_heap = 0;
+
+                if (use_uring && chunk_len > 1) {
+                    /* io_uring: must persist until wait */
+                    iov = (struct iovec *)malloc((size_t)chunk_len * sizeof(struct iovec));
+                    iov_on_heap = 1;
+                } else if (chunk_len <= 128) {
+                    iov = stack_iov;
+                } else {
+                    iov = (struct iovec *)malloc((size_t)chunk_len * sizeof(struct iovec));
+                    iov_on_heap = 1;
+                }
+                if (!iov) { rc = GRAVELDB_ERR_OOM; sub_pos = rj; break; }
+
+                int iovcnt = 0;
+                off_t base_offset = (off_t)dirty_pages[sub_pos] * s->page_size;
+
+                for (int k = sub_pos; k < chunk_end; k++) {
+                    uint32_t pg = dirty_pages[k];
+                    uint32_t slot_idx = pagemap_find(wb->slots, wb->capacity, pg);
+                    if (wb->slots[slot_idx].page_id != pg) continue;
+                    iov[iovcnt].iov_base = wb->slots[slot_idx].data;
+                    iov[iovcnt].iov_len = s->page_size;
+                    iovcnt++;
+                }
+
+                if (iovcnt > 0) {
+                    if (use_uring) {
+                        if (iovcnt == 1) {
+                            if (uring_io_submit_write(&io_ctx, s->fd,
+                                                      iov[0].iov_base, iov[0].iov_len,
+                                                      base_offset) < 0) {
+                                rc = GRAVELDB_ERR_IO;
+                            }
+                        } else {
+                            if (uring_io_submit_writev(&io_ctx, s->fd,
+                                                       iov, iovcnt, base_offset) < 0) {
+                                rc = GRAVELDB_ERR_IO;
+                            }
+                        }
+                    } else {
+                        if (iovcnt == 1) {
+                            ssize_t wr = pwrite(s->fd, iov[0].iov_base, iov[0].iov_len,
+                                                base_offset);
+                            if (wr != (ssize_t)iov[0].iov_len) rc = GRAVELDB_ERR_IO;
+                        } else {
+                            ssize_t wr = pwritev(s->fd, iov, iovcnt, base_offset);
+                            size_t expected = (size_t)iovcnt * s->page_size;
+                            if (wr < 0 || (size_t)wr != expected) rc = GRAVELDB_ERR_IO;
+                        }
+                    }
+                }
+
+                /* Defer free for io_uring writev iov; free immediately for fallback */
+                if (iov_on_heap) {
+                    if (use_uring && iovcnt > 1) {
+                        /* Keep alive until uring_io_wait */
+                        if (iov_heap_count >= iov_heap_cap) {
+                            int new_cap = iov_heap_cap ? iov_heap_cap * 2 : 16;
+                            struct iovec **tmp = (struct iovec **)realloc(
+                                iov_heap_ptrs, (size_t)new_cap * sizeof(struct iovec *));
+                            if (tmp) { iov_heap_ptrs = tmp; iov_heap_cap = new_cap; }
+                        }
+                        if (iov_heap_count < iov_heap_cap) {
+                            iov_heap_ptrs[iov_heap_count++] = iov;
+                        } else {
+                            free(iov); /* fallback: can't track, free now (may corrupt io_uring) */
+                        }
+                    } else {
+                        free(iov);
+                    }
+                }
+
+                sub_pos = chunk_end;
+            }
+
+            ri = rj;
+        }
+
+        #undef FLUSH_IOV_MAX
 
         wb->flush_bytes += (size_t)(j - i) * s->page_size;
         i = j;
     }
 
-    /* Submit fsync + wait for all I/O to complete */
+    /* Wait for writes; optionally fdatasync */
     if (use_uring) {
-        uring_io_submit_fsyncs(&io_ctx);
+        if (sync) uring_io_submit_fsyncs(&io_ctx);
         int errors = uring_io_wait(&io_ctx);
         if (errors > 0) rc = GRAVELDB_ERR_IO;
+    } else if (sync) {
+        /* Fallback: pwrite is synchronous, but fdatasync for durability */
+        if (fdatasync(s->key_fd) != 0) rc = GRAVELDB_ERR_IO;
+        if (fdatasync(s->fd) != 0) rc = GRAVELDB_ERR_IO;
     }
     uring_io_destroy(&io_ctx);
 
+    /* Free iov arrays that were kept alive for io_uring writev */
+    for (int k = 0; k < iov_heap_count; k++) {
+        free(iov_heap_ptrs[k]);
+    }
+    free(iov_heap_ptrs);
+
     /*
-     * Free pages AFTER all I/O is confirmed complete.
-     * Critical for io_uring: buffers must remain valid until writes finish.
+     * Free pages AFTER I/O confirmed complete (io_uring buffers must stay valid).
      */
-    for (int k = 0; k < n; k++) {
-        uint32_t pg = dirty_pages[k];
-        uint32_t slot_idx = pagemap_find(wb->slots, wb->capacity, pg);
-        if (wb->slots[slot_idx].page_id != pg) continue;
-        slab_free_aligned(s->allocator, wb->slots[slot_idx].data, s->page_size);
-        pagemap_remove(wb->slots, wb->capacity, slot_idx);
-        wb->count--;
+    if (n == (int)wb->count) {
+        /* Full flush: recycle all, bulk-clear hashmap */
+        for (int k = 0; k < n; k++) {
+            uint32_t pg = dirty_pages[k];
+            uint32_t slot_idx = pagemap_find(wb->slots, wb->capacity, pg);
+            if (wb->slots[slot_idx].page_id != pg) continue;
+            write_buf_recycle_page(wb, wb->slots[slot_idx].data);
+        }
+        memset(wb->slots, 0xFF, wb->capacity * sizeof(PageSlot));
+        wb->count = 0;
+    } else {
+        /* Partial flush: memset + re-insert remaining pages.
+         * Much faster than scanning 262K slots for rehash. */
+
+        /* Step 1: recycle flushed pages' buffers, collect remaining pages */
+        /* We use a bitmap on the sorted dirty_pages for O(log n) membership test,
+         * but simpler: mark flushed in slot, then sweep non-empty into temp array. */
+        for (int k = 0; k < n; k++) {
+            uint32_t pg = dirty_pages[k];
+            uint32_t slot_idx = pagemap_find(wb->slots, wb->capacity, pg);
+            if (wb->slots[slot_idx].page_id != pg) continue;
+            write_buf_recycle_page(wb, wb->slots[slot_idx].data);
+            wb->slots[slot_idx].page_id = PAGE_SLOT_EMPTY;
+            wb->slots[slot_idx].data = NULL;
+        }
+
+        /* Step 2: collect remaining pages into a compact temp array */
+        uint32_t remaining = wb->count - (uint32_t)n;
+        PageSlot *tmp_slots = NULL;
+        if (remaining > 0) {
+            tmp_slots = (PageSlot *)malloc(remaining * sizeof(PageSlot));
+        }
+        if (tmp_slots) {
+            uint32_t ri = 0;
+            for (uint32_t ci = 0; ci < wb->capacity && ri < remaining; ci++) {
+                if (wb->slots[ci].page_id != PAGE_SLOT_EMPTY) {
+                    tmp_slots[ri++] = wb->slots[ci];
+                }
+            }
+            remaining = ri;
+
+            /* Step 3: bulk-clear hashmap and re-insert remaining */
+            memset(wb->slots, 0xFF, wb->capacity * sizeof(PageSlot));
+            for (uint32_t ri2 = 0; ri2 < remaining; ri2++) {
+                uint32_t idx = pagemap_find(wb->slots, wb->capacity, tmp_slots[ri2].page_id);
+                wb->slots[idx] = tmp_slots[ri2];
+            }
+            free(tmp_slots);
+            wb->count = remaining;
+        } else {
+            /* OOM fallback: in-place rehash (slower but no alloc) */
+            uint32_t cnt = 0;
+            for (uint32_t ci = 0; ci < wb->capacity; ci++) {
+                if (wb->slots[ci].page_id == PAGE_SLOT_EMPTY) continue;
+                PageSlot t = wb->slots[ci];
+                wb->slots[ci].page_id = PAGE_SLOT_EMPTY;
+                wb->slots[ci].data = NULL;
+                uint32_t new_idx = pagemap_find(wb->slots, wb->capacity, t.page_id);
+                wb->slots[new_idx] = t;
+                cnt++;
+            }
+            wb->count = cnt;
+        }
     }
 
     return rc;
@@ -739,65 +872,15 @@ static inline bool dimbin_should_flush(DimBin *s) {
     return s->write_buf.count >= threshold;
 }
 
-/*
- * Proactive flush: randomly sample a few dirty pages from write buffer and
- * flush them to disk. This spreads I/O evenly across time instead of
- * concentrating it all at checkpoint or buffer-full moments.
- *
- * Strategy: random pick (not min-heap) -- O(1) per sample, zero overhead on
- * the write hot path. Trades perfect age-ordering for simplicity and no
- * structural overhead. Since all buffered pages are equally "pending flush",
- * random eviction is fair enough; the key goal is reducing the residual count
- * before checkpoint begins.
- */
-static void dimbin_proactive_flush(DimBin *s) {
-    WriteBuffer *wb = &s->write_buf;
-
-    if (wb->count == 0) return;
-
-    uint32_t to_flush = WB_PROACTIVE_FLUSH_BATCH;
-    if (to_flush > wb->count) to_flush = wb->count;
-
-    uint32_t mask = wb->capacity - 1;
-    uint32_t flushed = 0;
-    uint32_t max_attempts = wb->capacity;  /* prevent infinite loop */
-    uint32_t attempts = 0;
-
-    while (flushed < to_flush && attempts < max_attempts) {
-        uint32_t idx = xorshift32(&wb->rng_state) & mask;
-        attempts++;
-
-        if (wb->slots[idx].page_id == PAGE_SLOT_EMPTY) continue;
-
-        uint32_t page_id = wb->slots[idx].page_id;
-        uint8_t *data = wb->slots[idx].data;
-
-        /* Write page to disk */
-        ssize_t wr = pwrite(s->fd, data, s->page_size, (off_t)page_id * s->page_size);
-        if (wr == (ssize_t)s->page_size) {
-            /* Success: free page and remove from hashmap */
-            slab_free_aligned(s->allocator, data, s->page_size);
-            pagemap_remove(wb->slots, wb->capacity, idx);
-            wb->count--;
-            wb->flush_bytes += s->page_size;
-            flushed++;
-        }
-    }
-
-    /* Single fdatasync to cover all proactively flushed pages */
-    if (flushed > 0) {
-        fdatasync(s->fd);
-    }
-}
-
 graveldb_status_t dimbin_checkpoint_begin(DimBin *s) {
     /* Flush write buffer before freezing card table bitmap. */
-    dimbin_flush(s);
+    dimbin_flush(s, true);
 
     dirty_tracker_swap(&s->dirty);
 
     s->overlay.allocator = s->allocator;
     overlay_init(&s->overlay, s->dim);
+    s->overlay.budget_bytes = s->overlay_budget;
     s->in_checkpoint = true;
 
     return GRAVELDB_OK;
@@ -806,17 +889,58 @@ graveldb_status_t dimbin_checkpoint_begin(DimBin *s) {
 graveldb_status_t dimbin_checkpoint_end(DimBin *s) {
     s->in_checkpoint = false;
 
-    /* Replay overlay entries back into main storage.
-     * OA layout: scan both tables (new + old if mid-rehash), skip empty slots. */
-    for (uint32_t i = 0; i < s->overlay.capacity; i++) {
-        if (s->overlay.slots[i].entry_id != OVERLAY_EMPTY) {
-            dimbin_put(s, s->overlay.slots[i].entry_id, s->overlay.slots[i].data);
-        }
-    }
-    if (s->overlay.old_slots) {
-        for (uint32_t i = 0; i < s->overlay.old_capacity; i++) {
-            if (s->overlay.old_slots[i].entry_id != OVERLAY_EMPTY) {
-                dimbin_put(s, s->overlay.old_slots[i].entry_id, s->overlay.old_slots[i].data);
+    /* Replay overlay entries back into main storage via batched path */
+    uint32_t total_overlay = s->overlay.count;
+    if (total_overlay > 0) {
+        EmbWriteEntry *replay_buf = (EmbWriteEntry *)malloc(total_overlay * sizeof(EmbWriteEntry));
+        if (replay_buf) {
+            uint32_t collected = 0;
+
+            for (uint32_t i = 0; i < s->overlay.capacity && collected < total_overlay; i++) {
+                if (s->overlay.slots[i].entry_id != OVERLAY_EMPTY) {
+                    replay_buf[collected].entry_id = s->overlay.slots[i].entry_id;
+                    replay_buf[collected].data = s->overlay.slots[i].data;
+                    collected++;
+                }
+            }
+            if (s->overlay.old_slots) {
+                for (uint32_t i = 0; i < s->overlay.old_capacity && collected < total_overlay; i++) {
+                    if (s->overlay.old_slots[i].entry_id != OVERLAY_EMPTY) {
+                        replay_buf[collected].entry_id = s->overlay.old_slots[i].entry_id;
+                        replay_buf[collected].data = s->overlay.old_slots[i].data;
+                        collected++;
+                    }
+                }
+            }
+
+            /* Submit in chunks to avoid long pause (progressive drain) */
+            #define OVERLAY_REPLAY_CHUNK  1024
+            uint32_t pos = 0;
+            while (pos < collected) {
+                uint32_t chunk = collected - pos;
+                if (chunk > OVERLAY_REPLAY_CHUNK) chunk = OVERLAY_REPLAY_CHUNK;
+                dimbin_put_batch(s, &replay_buf[pos], (int)chunk);
+                pos += chunk;
+            }
+            #undef OVERLAY_REPLAY_CHUNK
+            free(replay_buf);
+        } else {
+            /* OOM fallback: replay one by one (correctness over performance) */
+            for (uint32_t i = 0; i < s->overlay.capacity; i++) {
+                if (s->overlay.slots[i].entry_id != OVERLAY_EMPTY) {
+                    EmbWriteEntry e = { .entry_id = s->overlay.slots[i].entry_id,
+                                        .data = s->overlay.slots[i].data };
+                    dimbin_put_batch(s, &e, 1);
+                }
+            }
+            if (s->overlay.old_slots) {
+                for (uint32_t i = 0; i < s->overlay.old_capacity; i++) {
+                    if (s->overlay.old_slots[i].entry_id != OVERLAY_EMPTY) {
+                        EmbWriteEntry e = { .entry_id = s->overlay.old_slots[i].entry_id,
+                                            .data = s->overlay.old_slots[i].data };
+                        dimbin_put_batch(s, &e, 1);
+                    }
+                }
             }
         }
     }

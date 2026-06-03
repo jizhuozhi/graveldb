@@ -42,8 +42,8 @@ typedef struct DirtyNode {
  *   [segment_id * span, (segment_id+1) * span)
  */
 typedef struct {
-    uint32_t    segment_id;
-    DirtyNode  *root;
+    uint32_t   segment_id;
+    DirtyNode *root;
 } DirtySegment;
 
 /*

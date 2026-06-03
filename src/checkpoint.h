@@ -6,7 +6,7 @@
  * Responsibilities:
  *   1. Periodic checkpoint scheduling (interval-based)
  *   2. Delta file I/O: dump + recovery
- *   3. Footer persistence (dual-footer crash-safe)
+ *   3. Meta persistence (atomic write to separate .meta file)
  *   4. Full checkpoint lifecycle management
  *   5. Delta chain management (compaction to full)
  *
@@ -16,10 +16,9 @@
  *   (cooperative tick) -- no background threads, no locks.
  *
  * Storage format:
- *   Each DimBin file is self-contained:
- *     [Entry Data...][Index Block][FreeList Block][Footer A (64B)][Footer B (64B)]
- *   Delta files are separate:
- *     [DeltaHeader][Entry0][Entry1]...
+ *   Each DimBin file is pure data: [Entry Data...]
+ *   Metadata (generation) lives in a separate .meta file per bin.
+ *   Delta files are separate: [DeltaHeader][Entry0][Entry1]...
  */
 
 #ifndef GRAVELDB_CHECKPOINT_H_
@@ -30,25 +29,32 @@
 #include <stdbool.h>
 #include "graveldb.h"
 #include "dimbin.h"
+#include "io_uring_flush.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+/*
+ * BinMeta: minimal metadata persisted in a separate .meta file.
+ * Only contains generation (for delta chain continuity tracking).
+ * Written atomically via write-to-temp + fsync + rename.
+ *
+ * On-disk format: 16 bytes, little-endian (see wire.h for encode/decode).
+ * This struct is for in-memory use only — never written directly to disk.
+ */
 typedef struct {
     uint32_t magic;
-    uint32_t version;
-    uint32_t dim;
-    uint32_t _pad0;
-    uint64_t num_entries;
-    uint64_t bump_ptr;
-    uint64_t free_list_offset;
-    uint64_t free_list_size;
     uint64_t generation;
     uint32_t checksum;
-    uint32_t _pad1;
-} __attribute__((packed)) FileFooter;
+} BinMeta;
 
+/*
+ * DeltaHeader: header of each delta checkpoint file.
+ *
+ * On-disk format: 40 bytes, little-endian (see wire.h for encode/decode).
+ * This struct is for in-memory use only — never written directly to disk.
+ */
 typedef struct {
     uint32_t magic;
     uint32_t version;
@@ -58,7 +64,7 @@ typedef struct {
     uint64_t bump_ptr;
     uint32_t num_entries;
     uint32_t checksum;
-} __attribute__((packed)) DeltaHeader;
+} DeltaHeader;
 
 /*
  * Incremental checkpoint progress state machine.
@@ -161,10 +167,21 @@ graveldb_status_t ckpt_dump_delta(DimBin *bin, const char *data_dir,
 
 graveldb_status_t ckpt_dump_full(DimBin *bin, const char *data_dir);
 
-graveldb_status_t ckpt_persist_footer(DimBin *bin, uint64_t num_entries,
-                                      uint64_t generation);
+/*
+ * Persist metadata to a separate .meta file using atomic write:
+ *   write(tmp) → fsync(tmp) → rename(tmp, final) → fsync(dir)
+ * This guarantees the .meta file is always valid or absent.
+ */
+graveldb_status_t ckpt_persist_meta(DimBin *bin, const char *data_dir,
+                                    uint64_t generation);
 
-graveldb_status_t ckpt_read_footer(int fd, FileFooter *out_footer);
+/*
+ * Read metadata from the .meta file for the given bin.
+ * Returns GRAVELDB_OK on success, GRAVELDB_ERR_CORRUPT if file is
+ * missing/invalid/checksum mismatch (treated as fresh DB).
+ */
+graveldb_status_t ckpt_read_meta(const char *data_dir, int dim,
+                                 BinMeta *out_meta);
 
 graveldb_status_t ckpt_recover(struct GravelDB *db);
 graveldb_status_t ckpt_replay_delta(DimBin *bin, const char *delta_path);
@@ -193,6 +210,148 @@ typedef struct {
 } CkptStats;
 
 void ckpt_scheduler_stats(const CkptScheduler *sched, CkptStats *out);
+
+/*
+ * Unified Checkpoint Export API (internal structures)
+ *
+ * Both full and delta checkpoints use the same entry-interleaved wire format:
+ *   [CkptExportHeader][feat_id|embedding][feat_id|embedding]...
+ *
+ * Full: scans all valid entries. Serves as truncation point (discard prior deltas).
+ * Delta: scans only dirty entries (from frozen bitmap).
+ *
+ * Both rely on overlay for SATB (snapshot-at-the-beginning) isolation:
+ *   - checkpoint_begin() freezes state via overlay
+ *   - Export reads from main file (which holds the frozen-time data)
+ *   - Concurrent writes go into overlay, not main file
+ *   - No flush needed during export
+ *
+ * IO is non-blocking: reads are submitted via io_uring (or fallback pread),
+ * then polled in the event loop. This avoids blocking the host thread.
+ *
+ * Backpressure: if overlay reaches budget, writes get GRAVELDB_ERR_BUSY.
+ */
+
+/* Max entries to read in a single step (bounds io_uring SQ depth usage) */
+#define CKPT_EXPORT_IO_BATCH  256
+
+/*
+ * Coalesced IO range: a contiguous run of valid entries in the data file.
+ * Instead of issuing one pread per entry, adjacent entries are merged into
+ * a single large read. This eliminates random-read amplification for
+ * bump-allocated data where most entries are physically contiguous.
+ */
+typedef struct {
+    uint32_t  start_idx;    /* first entry_idx in this run */
+    uint32_t  count;        /* number of contiguous entries */
+    uint8_t  *buf;          /* read target (points into read_buf_pool) */
+} CkptCoalescedRange;
+
+/*
+ * Per-entry metadata: after key batch read, we record valid entries
+ * so that poll can output them in order.
+ */
+typedef struct {
+    uint64_t  feat_id;
+    uint32_t  entry_idx;
+    uint8_t  *buf;       /* pointer into read_buf_pool for this entry's data */
+} CkptExportReadOp;
+
+/*
+ * Export pipeline phases:
+ *   PHASE_KEY_READ   - key batch read submitted, waiting for completion
+ *   PHASE_EMB_READ   - embedding coalesced reads submitted, waiting
+ *   PHASE_OUTPUT     - all reads done, outputting via write_cb
+ */
+typedef enum {
+    CKPT_EXPORT_PHASE_IDLE = 0,
+    CKPT_EXPORT_PHASE_KEY_READ,
+    CKPT_EXPORT_PHASE_EMB_READ,
+    CKPT_EXPORT_PHASE_OUTPUT,
+} CkptExportPhase;
+
+/*
+ * Export context: holds state for a progressive full/delta export.
+ * One context per DimBin. Created by graveldb_ckpt_export_begin.
+ *
+ * Lifecycle: begin → (step + poll) loop → end.
+ *
+ * IO strategy (sequential scan + coalesced reads + pipeline):
+ *   1. Keys are read in bulk (batch_entries * 8 bytes per step) via io_uring
+ *   2. Valid entries are identified, adjacent ones coalesced into ranges
+ *   3. Embedding reads are submitted as coalesced large pread ops
+ *   4. Key IO and embedding IO can overlap across steps (pipeline)
+ */
+struct GravelDBCkptExport {
+    GravelDB      *db;
+    DimBin        *bin;
+    uint32_t       cursor;         /* next entry_idx to scan (full) */
+    uint32_t       snapshot_bump;  /* bump_ptr at begin time */
+    uint64_t       generation;     /* checkpoint generation */
+    uint64_t       base_gen;       /* base generation (for delta: prev gen; full: 0) */
+    uint64_t       num_entries;    /* entries written so far */
+    uint32_t       type;           /* GRAVELDB_CKPT_FULL or GRAVELDB_CKPT_DELTA */
+    uint32_t       batch_entries;  /* entries per step */
+    bool           header_written;
+    bool           scan_done;      /* true when scan phase is complete */
+
+    /* Zero-backpressure dump file: export writes here at full speed */
+    int            dump_fd;        /* writable fd for the dump file */
+    char           dump_path[512]; /* path to the dump file */
+    uint64_t       dump_size;      /* total bytes written to dump so far */
+    off_t          read_cursor;    /* host read position (for export_read) */
+
+    /* Delta mode: sorted array of dirty page indices */
+    uint32_t      *dirty_pages;
+    int            dirty_page_count;
+    int            dirty_page_cursor;
+
+    /* Pipeline phase tracking */
+    CkptExportPhase phase;
+
+    /* Key batch read buffer: batch_entries * 8 bytes */
+    uint64_t      *key_batch_buf;
+    uint32_t       key_batch_start;  /* entry_idx of first key in batch */
+    uint32_t       key_batch_count;  /* number of keys read this batch */
+
+    /* Coalesced embedding IO ranges */
+    CkptCoalescedRange *coalesced_ranges;
+    int            range_count;
+    int            range_capacity;
+
+    /* Per-entry output metadata (valid entries from key scan) */
+    CkptExportReadOp *read_ops;
+    int            read_op_count;    /* valid entries this step */
+
+    /* Async IO state */
+    uring_io_ctx_t io_ctx;
+    uint8_t       *read_buf_pool;    /* contiguous buffer for embedding reads */
+
+    /* If GRAVELDB_CKPT_ALSO_FULL was set on a delta export, this points to
+     * the internal full export context driven in lockstep. NULL otherwise. */
+    struct GravelDBCkptExport *paired_full;
+};
+
+/*
+ * Import context: holds state for progressive import with async writes.
+ */
+#define CKPT_IMPORT_BATCH  256
+
+struct GravelDBCkptImport {
+    GravelDB      *db;
+    DimBin        *bin;
+    int            import_fd;       /* read fd for the dump file */
+    bool           header_read;
+    bool           done;
+    uint32_t       dim;
+    uint32_t       entry_size;
+    uint64_t       generation;
+
+    /* Async IO state */
+    uring_io_ctx_t io_ctx;
+    int            pending_writes;
+    uint8_t       *write_buf_pool;   /* batch buffer: CKPT_IMPORT_BATCH * entry_size */
+};
 
 #ifdef __cplusplus
 }

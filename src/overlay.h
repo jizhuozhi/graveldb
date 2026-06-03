@@ -38,32 +38,39 @@ extern "C" {
  * entry_id == OVERLAY_EMPTY means the slot is empty.
  */
 typedef struct {
-    uint32_t    entry_id;
-    float      *data;
+    uint32_t entry_id;
+    float   *data;
 } OverlaySlot;
 
 typedef struct {
-    OverlaySlot  *slots;        /* current (new) table */
-    uint32_t      capacity;     /* current table capacity (power of 2) */
-    uint32_t      count;        /* total live entries */
-    uint32_t      mask;         /* capacity - 1 */
+    OverlaySlot   *slots;        /* current (new) table */
+    uint32_t       capacity;     /* current table capacity (power of 2) */
+    uint32_t       count;        /* total live entries */
+    uint32_t       mask;         /* capacity - 1 */
 
     /* Incremental rehash state */
-    OverlaySlot  *old_slots;
-    uint32_t      old_capacity;
-    uint32_t      old_mask;
-    uint32_t      rehash_cursor;
+    OverlaySlot   *old_slots;
+    uint32_t       old_capacity;
+    uint32_t       old_mask;
+    uint32_t       rehash_cursor;
 
     /* Tombstone list (logical deletes, deferred until checkpoint_end) */
-    uint32_t     *tombstones;
-    uint32_t      tomb_count;
-    uint32_t      tomb_capacity;
+    uint32_t      *tombstones;
+    uint32_t       tomb_count;
+    uint32_t       tomb_capacity;
 
-    size_t        memory_used;
+    size_t         memory_used;
+    size_t         budget_bytes;  /* max memory; 0 = unlimited */
 
-    SlabPool     *data_pool;
+    SlabPool      *data_pool;
     SlabAllocator *allocator;
 } OverlayBuffer;
+
+/* Returns true when overlay memory usage has reached the budget limit. */
+static inline bool overlay_full(const OverlayBuffer *ob) {
+    if (ob->budget_bytes == 0) return false;
+    return ob->memory_used >= ob->budget_bytes;
+}
 
 graveldb_status_t overlay_init(OverlayBuffer *ob, int dim);
 void overlay_destroy(OverlayBuffer *ob);

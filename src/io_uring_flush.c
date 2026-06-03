@@ -92,6 +92,21 @@ int uring_io_submit_write(uring_io_ctx_t *ctx, int fd,
     return 0;
 }
 
+int uring_io_submit_writev(uring_io_ctx_t *ctx, int fd,
+                           const struct iovec *iov, int iovcnt, off_t offset) {
+    if (!ctx->initialized) return -1;
+
+    struct io_uring_sqe *sqe = uring_io_get_sqe(ctx);
+    if (!sqe) return -1;
+
+    io_uring_prep_writev(sqe, fd, iov, (unsigned)iovcnt, offset);
+    io_uring_sqe_set_data(sqe, NULL);
+    ctx->pending++;
+
+    uring_io_track_fd(ctx, fd);
+    return 0;
+}
+
 int uring_io_submit_read(uring_io_ctx_t *ctx, int fd,
                          void *buf, size_t len, off_t offset) {
     if (!ctx->initialized) return -1;
@@ -156,6 +171,30 @@ int uring_io_wait(uring_io_ctx_t *ctx) {
     return ctx->errors;
 }
 
+int uring_io_poll(uring_io_ctx_t *ctx) {
+    if (!ctx->initialized || ctx->pending == 0) return 0;
+
+    struct io_uring *ring = (struct io_uring *)ctx->ring;
+
+    /* Ensure all SQEs are submitted to the kernel */
+    io_uring_submit(ring);
+
+    /* Non-blocking reap: peek completions without waiting */
+    struct io_uring_cqe *cqe;
+    unsigned head;
+    unsigned count = 0;
+    io_uring_for_each_cqe(ring, head, cqe) {
+        if (cqe->res < 0) ctx->errors++;
+        count++;
+    }
+    if (count > 0) {
+        io_uring_cq_advance(ring, count);
+        ctx->pending -= count;
+    }
+
+    return (int)ctx->pending;
+}
+
 void uring_io_destroy(uring_io_ctx_t *ctx) {
     if (!ctx->initialized) return;
     struct io_uring *ring = (struct io_uring *)ctx->ring;
@@ -163,6 +202,13 @@ void uring_io_destroy(uring_io_ctx_t *ctx) {
     free(ring);
     ctx->ring = NULL;
     ctx->initialized = false;
+}
+
+void uring_io_reset(uring_io_ctx_t *ctx) {
+    if (!ctx->initialized) return;
+    ctx->pending = 0;
+    ctx->errors = 0;
+    ctx->fsync_fd_count = 0;
 }
 
 bool uring_io_available(void) {
@@ -205,6 +251,22 @@ int uring_io_submit_write(uring_io_ctx_t *ctx, int fd,
     return 0;
 }
 
+int uring_io_submit_writev(uring_io_ctx_t *ctx, int fd,
+                           const struct iovec *iov, int iovcnt, off_t offset) {
+    if (!ctx->initialized) return -1;
+
+    ssize_t wr = pwritev(fd, iov, iovcnt, offset);
+    size_t expected = 0;
+    for (int i = 0; i < iovcnt; i++) expected += iov[i].iov_len;
+    if (wr < 0 || (size_t)wr != expected) {
+        ctx->errors++;
+        return -1;
+    }
+    ctx->pending++;
+    uring_io_track_fd_fallback(ctx, fd);
+    return 0;
+}
+
 int uring_io_submit_read(uring_io_ctx_t *ctx, int fd,
                          void *buf, size_t len, off_t offset) {
     if (!ctx->initialized) return -1;
@@ -234,9 +296,23 @@ int uring_io_wait(uring_io_ctx_t *ctx) {
     return (int)ctx->errors;
 }
 
+int uring_io_poll(uring_io_ctx_t *ctx) {
+    if (!ctx->initialized) return 0;
+    /* In fallback mode, all I/O completed synchronously during submit */
+    ctx->pending = 0;
+    return 0;
+}
+
 void uring_io_destroy(uring_io_ctx_t *ctx) {
     if (!ctx->initialized) return;
     ctx->initialized = false;
+}
+
+void uring_io_reset(uring_io_ctx_t *ctx) {
+    if (!ctx->initialized) return;
+    ctx->pending = 0;
+    ctx->errors = 0;
+    ctx->fsync_fd_count = 0;
 }
 
 bool uring_io_available(void) {

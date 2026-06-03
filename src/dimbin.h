@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include "graveldb.h"
 #include "dirty_tracker.h"
 #include "overlay.h"
@@ -30,8 +31,8 @@ extern "C" {
 #define PAGE_SLOT_EMPTY UINT32_MAX
 
 typedef struct {
-    uint32_t  page_id;
-    uint8_t  *data;
+    uint32_t page_id;
+    uint8_t *data;
 } PageSlot;
 
 /*
@@ -71,53 +72,88 @@ static inline void pagemap_remove(PageSlot *slots, uint32_t capacity, uint32_t r
  * Memory proportional to actual dirty page count, not max page_id.
  * Flushes when count reaches max_pages.
  *
- * Proactive flush: every PROACTIVE_FLUSH_INTERVAL writes, randomly sample
- * a few pages from the buffer and flush them eagerly. This amortizes I/O
- * so that checkpoint-time flush is smaller and latency spikes are reduced.
+ * Page buffers are recycled via a free-list (page_pool) to avoid
+ * free+alloc on the hot flush→put path.
  */
-#define WB_PROACTIVE_FLUSH_INTERVAL  64   /* trigger proactive flush every N puts */
-#define WB_PROACTIVE_FLUSH_BATCH      4   /* pages to flush per proactive trigger */
 
 typedef struct {
-    PageSlot   *slots;
-    uint32_t    capacity;       /* hash table capacity (power of 2) */
-    uint32_t    count;          /* number of occupied slots */
-    size_t      max_pages;      /* flush threshold */
-    uint64_t    flush_bytes;
-    uint32_t    write_counter;  /* monotonic put counter for proactive flush */
-    uint32_t    rng_state;      /* xorshift32 for random page sampling */
+    PageSlot  *slots;
+    uint32_t   capacity;    /* hash table capacity (power of 2) */
+    uint32_t   count;       /* number of occupied slots */
+    size_t     max_pages;   /* flush threshold */
+    uint64_t   flush_bytes;
+
+    /* Page buffer free-list: recycles page-sized buffers after flush */
+    uint8_t  **page_pool;
+    uint32_t   pool_count;
+    uint32_t   pool_capacity;
 } WriteBuffer;
 
+/*
+ * Page pool helpers: recycle page buffers instead of free+alloc.
+ */
+static inline void write_buf_recycle_page(WriteBuffer *wb, uint8_t *buf) {
+    if (wb->pool_count >= wb->pool_capacity) {
+        uint32_t new_cap = wb->pool_capacity ? wb->pool_capacity * 2 : 64;
+        uint8_t **new_pool = (uint8_t **)realloc(wb->page_pool, new_cap * sizeof(uint8_t *));
+        if (!new_pool) { free(buf); return; }
+        wb->page_pool = new_pool;
+        wb->pool_capacity = new_cap;
+    }
+    wb->page_pool[wb->pool_count++] = buf;
+}
+
+static inline void *write_buf_acquire_page(WriteBuffer *wb, SlabAllocator *alloc,
+                                            uint32_t page_size) {
+    if (wb->pool_count > 0) {
+        return wb->page_pool[--wb->pool_count];
+    }
+    return slab_alloc_aligned(alloc, page_size, 4096);
+}
+
+/*
+ * KeyWriteEntry: a single buffered key write (used for batch flush to disk).
+ */
+typedef struct {
+    uint32_t entry_idx;
+    uint64_t feat_id;
+} KeyWriteEntry;
+
+#include "key_btree.h"
+
 typedef struct DimBin {
-    int         dim;
-    uint32_t    page_size;
-    size_t      entry_size;
-    int         entries_per_page;
-    int         fd;
-    int         key_fd;
-    char       *file_path;
-    char       *key_file_path;
-    uint64_t    bump_ptr;
-    uint32_t   *free_list;
-    uint32_t    free_count;
-    uint32_t    free_capacity;
-    DirtyTracker dirty;
-    WriteBuffer write_buf;
-    OverlayBuffer overlay;
-    bool      in_checkpoint;
-    uint32_t   *flush_dirty_buf;
+    int            dim;
+    uint32_t       page_size;
+    size_t         entry_size;
+    int            entries_per_page;
+    int            fd;
+    int            key_fd;
+    char          *file_path;
+    char          *key_file_path;
+    uint64_t       bump_ptr;
+    uint32_t      *free_list;
+    uint32_t       free_count;
+    uint32_t       free_capacity;
+    DirtyTracker   dirty;
+    WriteBuffer    write_buf;
+    KeyBTree       key_buf;          /* buffered key writes (B-tree: sorted + dedup) */
+    OverlayBuffer  overlay;
+    bool           in_checkpoint;
+    bool           flush_needed;     /* set when water-level exceeded; server polls this */
+    size_t         overlay_budget;   /* max overlay bytes; 0 = unlimited */
+    uint32_t      *flush_dirty_buf;
 
     /* Slab allocator (non-owning pointer to GravelDB's allocator).
      * Eliminates global static pointer; supports multiple DB instances. */
     SlabAllocator *allocator;
-    uint64_t    total_entries;
-    uint64_t    total_pages;
-    uint64_t    io_errors;       /* cumulative I/O error count (non-fatal) */
+    uint64_t       total_entries;
+    uint64_t       total_pages;
+    uint64_t       io_errors;        /* cumulative I/O error count (non-fatal) */
 
     /* Tracked file sizes: avoid per-entry fstat syscalls.
      * Updated on init (from fstat) and on ftruncate. */
-    size_t      data_file_size;
-    size_t      key_file_size;
+    size_t         data_file_size;
+    size_t         key_file_size;
 } DimBin;
 
 /*
@@ -131,15 +167,9 @@ void dimbin_destroy(DimBin *s);
 void dimbin_reserve(DimBin *s, uint32_t count);
 uint32_t dimbin_alloc_entry(DimBin *s);
 void dimbin_free_entry(DimBin *s, uint32_t entry_idx);
-graveldb_status_t dimbin_get(DimBin *s, uint32_t entry_id, float *buf);
-graveldb_status_t dimbin_put(DimBin *s, uint32_t entry_id, const float *data);
 
 /*
- * Batch embedding write with page-level coalescing.
- * Accepts array of (entry_id, data_ptr) pairs. Groups them by page,
- * loads each unique page once, patches all entries in-memory, defers
- * water-level flush to the end. Dramatically reduces ensure_page lookups
- * and avoids mid-batch flush interruptions.
+ * Batch embedding write entry.
  */
 typedef struct {
     uint32_t     entry_id;
@@ -150,25 +180,21 @@ graveldb_status_t dimbin_put_batch(DimBin *s, const EmbWriteEntry *entries, int 
 
 graveldb_status_t dimbin_put_key(DimBin *s, uint32_t entry_idx, uint64_t feat_id);
 
+/* Buffer a key write (flushed before values in dimbin_flush) */
+void dimbin_buf_key(DimBin *s, uint32_t entry_idx, uint64_t feat_id);
+
+/* Flush buffered keys to disk (no fdatasync; caller handles sync) */
+graveldb_status_t dimbin_flush_keys(DimBin *s);
+
 /*
- * Batched key write with user-space coalescing.
- * Accepts an array of (entry_idx, feat_id) pairs. Internally buckets them
- * by key-page and uses read-modify-write for dense pages, individual pwrite
- * for sparse pages. Reduces syscalls from N down to ~N/density.
- *
- * KEY_COALESCE_THRESH: minimum keys in one key-page to trigger
- * read-modify-write instead of individual pwrites.
+ * Batched key write with page-level coalescing.
+ * KEY_COALESCE_THRESH: density threshold for read-modify-write path.
  */
 #define KEY_COALESCE_THRESH 4
 
-typedef struct {
-    uint32_t  entry_idx;
-    uint64_t  feat_id;
-} KeyWriteEntry;
-
 void dimbin_put_keys_batch(DimBin *s, const KeyWriteEntry *entries, int count);
 
-graveldb_status_t dimbin_flush(DimBin *s);
+graveldb_status_t dimbin_flush(DimBin *s, bool sync);
 graveldb_status_t dimbin_checkpoint_begin(DimBin *s);
 graveldb_status_t dimbin_checkpoint_end(DimBin *s);
 
