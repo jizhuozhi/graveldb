@@ -1,6 +1,8 @@
 # Build output
 build/
+build-linux/
 cmake-build-*/
+Testing/
 
 # Design doc (internal context, not shipped)
 design.md

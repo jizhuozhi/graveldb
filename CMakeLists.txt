@@ -12,6 +12,9 @@ if(APPLE)
     add_compile_definitions(_DARWIN_C_SOURCE)
 endif()
 
+# Options
+option(GRAVELDB_BUILD_BENCHMARKS "Build performance benchmarks" OFF)
+
 # Library
 add_library(graveldb_lib STATIC
     src/hash_index.c
@@ -61,83 +64,28 @@ add_library(graveldb_client STATIC
 target_include_directories(graveldb_client PUBLIC example/client)
 target_include_directories(graveldb_client PRIVATE include example/protocol)
 
-# Tests
-add_executable(test-basic tests/test_basic.c)
-target_link_libraries(test-basic graveldb_lib pthread)
-target_include_directories(test-basic PRIVATE src)
+# ---- Tests ----
+# Single test program covering the public API (include/graveldb.h).
+# Internal modules are deliberately not unit-tested here: their behavior is
+# observable through the public surface, and unit tests for internals would
+# couple to implementation details and slow refactoring.
+add_executable(test-api tests/test_api.c)
+target_link_libraries(test-api graveldb_lib pthread m)
+target_include_directories(test-api PRIVATE tests)
 
-add_executable(test-hash-index tests/test_hash_index.c)
-target_link_libraries(test-hash-index graveldb_lib pthread)
-target_include_directories(test-hash-index PRIVATE src)
-
-add_executable(test-slab-alloc tests/test_slab_alloc.c)
-target_link_libraries(test-slab-alloc graveldb_lib pthread)
-target_include_directories(test-slab-alloc PRIVATE src)
-
-add_executable(test-dim-registry tests/test_dim_registry.c)
-target_link_libraries(test-dim-registry graveldb_lib pthread)
-target_include_directories(test-dim-registry PRIVATE src)
-
-add_executable(test-integration tests/test_integration.c)
-target_link_libraries(test-integration graveldb_lib pthread)
-target_include_directories(test-integration PRIVATE src)
-
-add_executable(test-checkpoint tests/test_checkpoint.c)
-target_link_libraries(test-checkpoint graveldb_lib pthread)
-target_include_directories(test-checkpoint PRIVATE src)
-
-# Benchmarks
-add_executable(bench-main tests/bench.c)
-target_link_libraries(bench-main graveldb_lib pthread)
-target_include_directories(bench-main PRIVATE src)
-
-add_executable(bench-hash tests/bench_hash_compare.c)
-target_include_directories(bench-hash PRIVATE src)
-
-add_executable(bench-dirty-tracker tests/bench_dirty_tracker.c)
-target_link_libraries(bench-dirty-tracker graveldb_lib pthread)
-target_include_directories(bench-dirty-tracker PRIVATE src)
-
-add_executable(bench-cache tests/bench_cache.c)
-target_link_libraries(bench-cache graveldb_lib pthread m)
-target_include_directories(bench-cache PRIVATE src)
-
-add_executable(bench-hash-index tests/bench_hash_index.c)
-target_link_libraries(bench-hash-index graveldb_lib pthread)
-target_include_directories(bench-hash-index PRIVATE src)
-
-add_executable(bench-slab-alloc tests/bench_slab_alloc.c)
-target_link_libraries(bench-slab-alloc graveldb_lib pthread)
-target_include_directories(bench-slab-alloc PRIVATE src)
-
-add_executable(bench-latency tests/bench_latency.c)
-target_link_libraries(bench-latency graveldb_lib pthread)
-target_include_directories(bench-latency PRIVATE src)
-
-add_executable(bench-write-buffer tests/bench_write_buffer.c)
-target_link_libraries(bench-write-buffer graveldb_lib pthread)
-target_include_directories(bench-write-buffer PRIVATE src)
-
-add_executable(bench-memory-scaling tests/bench_memory_scaling.c)
-target_link_libraries(bench-memory-scaling graveldb_lib pthread m)
-target_include_directories(bench-memory-scaling PRIVATE src)
-
-add_executable(bench-network example/bench/bench_network.c)
-target_link_libraries(bench-network graveldb_client graveldb_server_lib m)
-target_include_directories(bench-network PRIVATE example/client example/server include example/protocol)
-
-add_executable(bench-network-scale example/bench/bench_network_scale.c)
-target_link_libraries(bench-network-scale graveldb_client pthread m)
-target_include_directories(bench-network-scale PRIVATE example/client)
-
-# CTest
 enable_testing()
-add_test(NAME basic         COMMAND test-basic)
-add_test(NAME hash-index    COMMAND test-hash-index)
-add_test(NAME slab-alloc    COMMAND test-slab-alloc)
-add_test(NAME dim-registry  COMMAND test-dim-registry)
-add_test(NAME integration   COMMAND test-integration)
-add_test(NAME checkpoint    COMMAND test-checkpoint)
+add_test(NAME api COMMAND test-api)
+
+# ---- Benchmarks ----
+# Off by default; opt in with -DGRAVELDB_BUILD_BENCHMARKS=ON.
+# Not registered with ctest -- benches are run manually on perf hardware.
+if(GRAVELDB_BUILD_BENCHMARKS)
+    foreach(bench_name read_latency write_throughput checkpoint_impact)
+        add_executable(bench-${bench_name} bench/bench_${bench_name}.c)
+        target_link_libraries(bench-${bench_name} graveldb_lib pthread m)
+        target_include_directories(bench-${bench_name} PRIVATE bench include)
+    endforeach()
+endif()
 
 # Install
 install(TARGETS graveldb-server DESTINATION bin)
